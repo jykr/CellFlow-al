@@ -67,7 +67,9 @@ def compute_sinkhorn_div(x: ArrayLike, y: ArrayLike, epsilon: float = 1e-2) -> f
     )
 
 
-def compute_e_distance(x: ArrayLike, y: ArrayLike) -> float:
+def compute_e_distance(
+    x: ArrayLike, y: ArrayLike, memory_efficient: bool = True
+) -> float:
     """Compute the energy distance between x and y as in :cite:`Peidli2024`.
 
     Parameters
@@ -76,20 +78,49 @@ def compute_e_distance(x: ArrayLike, y: ArrayLike) -> float:
             An array of shape [num_samples, num_features].
         y
             An array of shape [num_samples, num_features].
+        memory_efficient
+            If True, uses memory-efficient pairwise distance calculation.
+            If False, uses direct broadcasting (faster for small d, but more memory).
 
     Returns
     -------
         A scalar denoting the energy distance value.
     """
-    sigma_X = pairwise_squeuclidean(x, x).mean()
-    sigma_Y = pairwise_squeuclidean(y, y).mean()
-    delta = pairwise_squeuclidean(x, y).mean()
+    sigma_X = pairwise_squeuclidean(x, x, memory_efficient=memory_efficient).mean()
+    sigma_Y = pairwise_squeuclidean(y, y, memory_efficient=memory_efficient).mean()
+    delta = pairwise_squeuclidean(x, y, memory_efficient=memory_efficient).mean()
     return 2 * delta - sigma_X - sigma_Y
 
 
-def pairwise_squeuclidean(x: ArrayLike, y: ArrayLike) -> ArrayLike:
-    """Compute pairwise squared euclidean distances."""
-    return ((x[:, None, :] - y[None, :, :]) ** 2).sum(-1)
+def pairwise_squeuclidean(
+    x: ArrayLike, y: ArrayLike, memory_efficient: bool = True
+) -> ArrayLike:
+    """Compute pairwise squared euclidean distances.
+
+    Parameters
+    ----------
+        x
+            An array of shape [n, d].
+        y
+            An array of shape [m, d].
+        memory_efficient
+            If True, uses ||x-y||^2 = ||x||^2 + ||y||^2 - 2<x,y> which is O(n*m) memory.
+            If False, uses direct broadcasting which is O(n*m*d) memory but may be faster for small d.
+
+    Returns
+    -------
+        An array of shape [n, m] containing pairwise squared distances.
+    """
+    if memory_efficient:
+        x_sqnorm = jnp.sum(x**2, axis=-1, keepdims=True)  # (n, 1)
+        y_sqnorm = jnp.sum(y**2, axis=-1, keepdims=True)  # (m, 1)
+        # ||x-y||^2 = ||x||^2 + ||y||^2 - 2<x,y>
+        dist = x_sqnorm + y_sqnorm.T - 2 * jnp.dot(x, y.T)
+        return jnp.maximum(
+            dist, 0.0
+        )  # Clip to avoid small negatives from numerical errors
+    else:
+        return ((x[:, None, :] - y[None, :, :]) ** 2).sum(-1)
 
 
 @jax.jit
@@ -141,7 +172,9 @@ def compute_metrics(x: ArrayLike, y: ArrayLike) -> dict[str, float]:
     return metrics
 
 
-def compute_mean_metrics(metrics: dict[str, dict[str, float]], prefix: str = "") -> dict[str, list[float]]:
+def compute_mean_metrics(
+    metrics: dict[str, dict[str, float]], prefix: str = ""
+) -> dict[str, list[float]]:
     """Compute the mean value of different metrics.
 
     Parameters
@@ -158,7 +191,9 @@ def compute_mean_metrics(metrics: dict[str, dict[str, float]], prefix: str = "")
         values over all pertubations.
     """
     metric_names = list(list(metrics.values())[0].keys())
-    metric_dict: dict[str, list[float]] = {prefix + met_name: [] for met_name in metric_names}
+    metric_dict: dict[str, list[float]] = {
+        prefix + met_name: [] for met_name in metric_names
+    }
     for met in metric_names:
         stat = 0.0
         for vals in metrics.values():
@@ -176,7 +211,9 @@ def rbf_kernel_fast(x: ArrayLike, y: ArrayLike, gamma: float) -> ArrayLike:
     return jnp.exp(-gamma * sq_distances)
 
 
-def maximum_mean_discrepancy(x: ArrayLike, y: ArrayLike, gamma: float = 1.0, exact: bool = False) -> float:
+def maximum_mean_discrepancy(
+    x: ArrayLike, y: ArrayLike, gamma: float = 1.0, exact: bool = False
+) -> float:
     """Compute the Maximum Mean Discrepancy (MMD) between two distributions x and y.
 
     Parameters
@@ -201,7 +238,9 @@ def maximum_mean_discrepancy(x: ArrayLike, y: ArrayLike, gamma: float = 1.0, exa
     return xx.mean() + yy.mean() - 2 * xy.mean()
 
 
-def compute_scalar_mmd(x: ArrayLike, y: ArrayLike, gammas: Sequence[float] | None = None) -> float:
+def compute_scalar_mmd(
+    x: ArrayLike, y: ArrayLike, gammas: Sequence[float] | None = None
+) -> float:
     """Compute the Mean Maximum Discrepancy (MMD) across different length scales
 
     Parameters

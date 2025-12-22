@@ -1,7 +1,9 @@
 import abc
 from collections.abc import Callable, Sequence
+import jax
+import gc
 from typing import Any, Literal
-
+from loguru import logger
 import anndata as ad
 import jax.tree as jt
 import jax.tree_util as jtu
@@ -177,11 +179,15 @@ class Metrics(ComputationCallback):
         metric_aggregations: list[Literal["mean", "median"]] = None,
     ):
         self.metrics = metrics
-        self.metric_aggregation = ["mean"] if metric_aggregations is None else metric_aggregations
+        self.metric_aggregation = (
+            ["mean"] if metric_aggregations is None else metric_aggregations
+        )
         for metric in metrics:
             # TODO: support custom callables as metrics
             if metric not in metric_to_func:
-                raise ValueError(f"Metric {metric} not supported. Supported metrics are {list(metric_to_func.keys())}")
+                raise ValueError(
+                    f"Metric {metric} not supported. Supported metrics are {list(metric_to_func.keys())}"
+                )
 
     def on_train_begin(self, *args: Any, **kwargs: Any) -> Any:
         """Called at the beginning of training."""
@@ -215,10 +221,16 @@ class Metrics(ComputationCallback):
         metrics = {}
         for metric in self.metrics:
             for k in valid_true_data.keys():
-                out = jtu.tree_map(metric_to_func[metric], valid_true_data[k], valid_pred_data[k])
+                out = jtu.tree_map(
+                    metric_to_func[metric], valid_true_data[k], valid_pred_data[k]
+                )
+                logger.debug(f"Computed {metric} for validation key {k}: {out}")
                 out_flattened = jt.flatten(out)[0]
                 for agg_fn in self.metric_aggregation:
-                    metrics[f"{k}_{metric}_{agg_fn}"] = agg_fn_to_func[agg_fn](out_flattened)
+                    metrics[f"{k}_{metric}_{agg_fn}"] = agg_fn_to_func[agg_fn](
+                        out_flattened
+                    )
+                metrics[f"{k}_{metric}"] = out
 
         return metrics  # type: ignore[return-value]
 
@@ -247,7 +259,9 @@ class Metrics(ComputationCallback):
         -------
             Computed metrics between the true validation data and predicted validation data as a dictionary
         """
-        return self.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, solver)
+        return self.on_log_iteration(
+            valid_source_data, valid_true_data, valid_pred_data, solver
+        )
 
 
 class PCADecodedMetrics(Metrics):
@@ -278,7 +292,9 @@ class PCADecodedMetrics(Metrics):
         super().__init__(metrics, metric_aggregations)
         self.pcs = ref_adata.varm["PCs"]
         self.means = ref_adata.varm["X_mean"]
-        self.reconstruct_data = lambda x: x @ np.transpose(self.pcs) + np.transpose(self.means)
+        self.reconstruct_data = lambda x: x @ np.transpose(self.pcs) + np.transpose(
+            self.means
+        )
         self.log_prefix = log_prefix
 
     def on_log_iteration(
@@ -385,8 +401,12 @@ class VAEDecodedMetrics(Metrics):
         valid_true_data_in_anndata = jtu.tree_map(self._create_anndata, valid_true_data)
         predicted_data_in_anndata = jtu.tree_map(self._create_anndata, valid_pred_data)
 
-        valid_true_data_decoded = jtu.tree_map(self.reconstruct_data, valid_true_data_in_anndata)
-        predicted_data_decoded = jtu.tree_map(self.reconstruct_data, predicted_data_in_anndata)
+        valid_true_data_decoded = jtu.tree_map(
+            self.reconstruct_data, valid_true_data_in_anndata
+        )
+        predicted_data_decoded = jtu.tree_map(
+            self.reconstruct_data, predicted_data_in_anndata
+        )
 
         metrics = super().on_log_iteration(
             valid_source_data={},
@@ -442,13 +462,17 @@ class WandbLogger(LoggingCallback):
 
             self.wandb = wandb
         except ImportError:
-            raise ImportError("wandb is not installed, please install it via `pip install wandb`") from None
+            raise ImportError(
+                "wandb is not installed, please install it via `pip install wandb`"
+            ) from None
         try:
             import omegaconf
 
             self.omegaconf = omegaconf
         except ImportError:
-            raise ImportError("omegaconf is not installed, please install it via `pip install omegaconf`") from None
+            raise ImportError(
+                "omegaconf is not installed, please install it via `pip install omegaconf`"
+            ) from None
 
     def on_train_begin(self) -> Any:
         """Called at the beginning of training to initiate WandB logging"""
@@ -459,7 +483,9 @@ class WandbLogger(LoggingCallback):
             project=self.project,
             config=self.omegaconf.OmegaConf.to_container(config, resolve=True),
             dir=self.out_dir,
-            settings=self.wandb.Settings(start_method=self.kwargs.pop("start_method", "thread")),
+            settings=self.wandb.Settings(
+                start_method=self.kwargs.pop("start_method", "thread")
+            ),
             **self.kwargs,
         )
 
@@ -498,10 +524,14 @@ class CallbackRunner:
         self.computation_callbacks: list[ComputationCallback] = [
             c for c in callbacks if isinstance(c, ComputationCallback)
         ]
-        self.logging_callbacks: list[LoggingCallback] = [c for c in callbacks if isinstance(c, LoggingCallback)]
+        self.logging_callbacks: list[LoggingCallback] = [
+            c for c in callbacks if isinstance(c, LoggingCallback)
+        ]
 
         if len(self.computation_callbacks) == 0 & len(self.logging_callbacks) != 0:
-            raise ValueError("No computation callbacks defined to compute metrics to log")
+            raise ValueError(
+                "No computation callbacks defined to compute metrics to log"
+            )
 
     def on_train_begin(self) -> Any:
         """Called at the beginning of training to initiate callbacks"""
@@ -539,8 +569,12 @@ class CallbackRunner:
         dict_to_log: dict[str, Any] = {}
 
         for callback in self.computation_callbacks:
-            results = callback.on_log_iteration(valid_source_data, valid_data, pred_data, solver)
+            results = callback.on_log_iteration(
+                valid_source_data, valid_data, pred_data, solver
+            )
             dict_to_log.update(results)
+            jax.clear_caches()
+            gc.collect()
 
         for callback in self.logging_callbacks:
             callback.on_log_iteration(dict_to_log)  # type: ignore[call-arg]
@@ -575,7 +609,9 @@ class CallbackRunner:
         dict_to_log: dict[str, Any] = {}
 
         for callback in self.computation_callbacks:
-            results = callback.on_train_end(valid_source_data, valid_data, pred_data, solver)
+            results = callback.on_train_end(
+                valid_source_data, valid_data, pred_data, solver
+            )
             dict_to_log.update(results)
 
         for callback in self.logging_callbacks:

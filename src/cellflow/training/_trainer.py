@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import gc
 from typing import Any, Literal
 
 import jax
@@ -40,7 +41,9 @@ class CellFlowTrainer:
         seed: int = 0,
     ):
         if not isinstance(solver, (_otfm.OTFlowMatching | _genot.GENOT)):
-            raise NotImplementedError(f"Solver must be an instance of OTFlowMatching or GENOT, got {type(solver)}")
+            raise NotImplementedError(
+                f"Solver must be an instance of OTFlowMatching or GENOT, got {type(solver)}"
+            )
 
         self.solver = solver
         self.predict_kwargs = predict_kwargs or {}
@@ -67,7 +70,9 @@ class CellFlowTrainer:
             condition = batch.get("condition", None)
             true_tgt = batch["target"]
             valid_source_data[val_key] = src
-            valid_pred_data[val_key] = self.solver.predict(src, condition=condition, **self.predict_kwargs)
+            valid_pred_data[val_key] = self.solver.predict(
+                src, condition=condition, **self.predict_kwargs
+            )
             valid_true_data[val_key] = true_tgt
 
         return valid_source_data, valid_true_data, valid_pred_data
@@ -124,33 +129,52 @@ class CellFlowTrainer:
         sampler = dataloader
         if isinstance(dataloader, OOCTrainSampler):
             dataloader.set_sampler(num_iterations=num_iterations)
+        valid_loss = 1e6
+        patience=10
+        waited = 0
         for it in pbar:
             rng_jax, rng_step_fn = jax.random.split(rng_jax, 2)
             batch = sampler.sample(rng_np)
             loss = self.solver.step_fn(rng_step_fn, batch)
             self.training_logs["loss"].append(float(loss))
-
             if ((it - 1) % valid_freq == 0) and (it > 1):
                 # Get predictions from validation data
-                valid_source_data, valid_true_data, valid_pred_data = self._validation_step(
-                    valid_loaders, mode="on_log_iteration"
+                valid_source_data, valid_true_data, valid_pred_data = (
+                    self._validation_step(valid_loaders, mode="on_log_iteration")
                 )
 
                 # Run callbacks
                 metrics = crun.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, self.solver)  # type: ignore[arg-type]
                 self._update_logs(metrics)
+                if metrics["test_sinkhorn_div_mean"] < valid_loss:
+                    valid_loss = metrics["test_sinkhorn_div_mean"]
+                    waited = 0
+                else:
+                    waited += 1
+                if waited >= patience:
+                    print(f"Early stopping at iteration {it}")
+                    jax.clear_caches()
+                    gc.collect()
+                    break
 
                 # Update progress bar
                 mean_loss = np.mean(self.training_logs["loss"][-valid_freq:])
-                postfix_dict = {metric: round(self.training_logs[metric][-1], 3) for metric in monitor_metrics}
+                postfix_dict = {
+                    metric: round(self.training_logs[metric][-1], 3)
+                    for metric in monitor_metrics
+                }
                 postfix_dict["loss"] = round(mean_loss, 3)
                 pbar.set_postfix(postfix_dict)
+                jax.clear_caches()
+                gc.collect()
 
         if num_iterations > 0:
             valid_source_data, valid_true_data, valid_pred_data = self._validation_step(
                 valid_loaders, mode="on_train_end"
             )
-            metrics = crun.on_train_end(valid_source_data, valid_true_data, valid_pred_data, self.solver)
+            metrics = crun.on_train_end(
+                valid_source_data, valid_true_data, valid_pred_data, self.solver
+            )
             self._update_logs(metrics)
 
         self.solver.is_trained = True
