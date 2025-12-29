@@ -225,9 +225,32 @@ class Metrics(ComputationCallback):
         metrics = {}
         for metric in self.metrics:
             for k in valid_true_data.keys():
-                out = jtu.tree_map(
-                    metric_to_func[metric], valid_true_data[k], valid_pred_data[k]
-                )
+                # Check if we can batch (all arrays same shape)
+                keys = list(valid_true_data[k].keys())
+                true_arrays = [valid_true_data[k][key] for key in keys]
+                pred_arrays = [valid_pred_data[k][key] for key in keys]
+
+                # Try batched computation if shapes match
+                shapes_match = all(
+                    t.shape == true_arrays[0].shape for t in true_arrays
+                ) and all(p.shape == pred_arrays[0].shape for p in pred_arrays)
+
+                if (
+                    len(keys) > 0
+                    and shapes_match
+                    and metric in ["e_distance", "sinkhorn_div"]
+                ):
+                    # Stack and use vmap for parallel computation
+                    true_stacked = jnp.stack(true_arrays, axis=0)
+                    pred_stacked = jnp.stack(pred_arrays, axis=0)
+                    batched_fn = jax.vmap(metric_to_func[metric])
+                    results = batched_fn(true_stacked, pred_stacked)
+                    out = {key: float(results[i]) for i, key in enumerate(keys)}
+                else:
+                    # Fall back to sequential
+                    out = jtu.tree_map(
+                        metric_to_func[metric], valid_true_data[k], valid_pred_data[k]
+                    )
                 logger.debug(f"Computed {metric} for validation key {k}: {out}")
                 out_flattened = jt.flatten(out)[0]
                 for agg_fn in self.metric_aggregation:
