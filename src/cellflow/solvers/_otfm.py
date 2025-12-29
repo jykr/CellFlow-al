@@ -1,7 +1,8 @@
 from collections.abc import Callable
 from functools import partial
+import os
 from typing import Any
-
+from loguru import logger
 import diffrax
 import jax
 import jax.numpy as jnp
@@ -159,10 +160,30 @@ class OTFlowMatching:
         # TODO: test whether it's better to sample the same noise for all samples or different ones
 
         if self.match_fn is not None:
-            tmat = self.match_fn(src, tgt)
+            if self.match_fn.__name__ == "labeled_match_linear":
+                source_labels = target_labels = batch["condition_idxs"]
+                tmat = self.match_fn(
+                    src,
+                    tgt,
+                    source_labels,
+                    target_labels,
+                )
+                if not os.path.exists("/scratch/jr7348/match.npy"):
+                    np.save("/scratch/jr7348/match.npy", np.array(tmat))
+                    np.save("/scratch/jr7348/src_labels.npy", np.array(source_labels))
+            elif self.match_fn.__name__ == "match_linear":
+                tmat = self.match_fn(src, tgt)
+            else:
+                raise NotImplementedError(
+                    f"Matching function {self.match_fn.__name__} not supported."
+                )
             src_ixs, tgt_ixs = solver_utils.sample_joint(rng_resample, tmat)
             src, tgt = src[src_ixs], tgt[tgt_ixs]
-
+            condition = (
+                jax.tree.map(lambda x: x[tgt_ixs], condition)
+                if condition is not None
+                else None
+            )
         self.vf_state, loss = self.vf_step_fn(
             rng_step_fn,
             self.vf_state,
@@ -216,9 +237,12 @@ class OTFlowMatching:
         **kwargs: Any,
     ) -> ArrayLike:
         """See :meth:`OTFlowMatching.predict`."""
-        kwargs.setdefault("dt0", None)
-        kwargs.setdefault("solver", diffrax.Tsit5())
-        kwargs.setdefault("stepsize_controller", diffrax.PIDController(rtol=1e-5, atol=1e-5))
+        # kwargs.setdefault("dt0", None)
+        # kwargs.setdefault("solver", diffrax.Tsit5())
+        # kwargs.setdefault("stepsize_controller", diffrax.PIDController(rtol=1e-5, atol=1e-5))
+        kwargs.setdefault("dt0", 0.01)  # Fixed step size: 100 steps total
+        kwargs.setdefault("solver", diffrax.Euler())
+        kwargs.setdefault("stepsize_controller", diffrax.ConstantStepSize())
         kwargs = frozen_dict.freeze(kwargs)
 
         noise_dim = (1, self.vf.condition_embedding_dim)

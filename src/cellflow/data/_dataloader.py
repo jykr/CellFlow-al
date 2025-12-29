@@ -3,7 +3,7 @@ import queue
 import threading
 from collections.abc import Generator
 from typing import Any, Literal
-
+from loguru import logger
 import jax
 import numpy as np
 
@@ -24,29 +24,67 @@ class TrainSampler:
 
     """
 
-    def __init__(self, data: TrainingData, batch_size: int = 1024):
+    def __init__(
+        self,
+        data: TrainingData,
+        batch_size: int = 1024,
+        n_conditions_per_batch: int = 1,
+    ) -> None:
         self._data = data
         self._data_idcs = np.arange(data.cell_data.shape[0])
         self.batch_size = batch_size
         self.n_source_dists = data.n_controls
         self.n_target_dists = data.n_perturbations
+        self.n_conditions_per_batch = (
+            n_conditions_per_batch  # Default: sample from 1 condition per batch
+        )
 
         self._control_to_perturbation_keys = sorted(data.control_to_perturbation.keys())
         self._has_condition_data = data.condition_data is not None
+
+        # Pre-compute valid indices for each source/target distribution (avoids np.where every sample)
+        self._source_indices = {
+            i: np.where(data.split_covariates_mask == i)[0]
+            for i in range(self.n_source_dists)
+        }
+        self._target_indices = {
+            i: np.where(data.perturbation_covariates_mask == i)[0]
+            for i in range(self.n_target_dists)
+        }
+        self.print_batch = True
 
     def _sample_target_dist_idx(self, source_dist_idx, rng):
         """Sample a target distribution index given the source distribution index."""
         return rng.choice(self._data.control_to_perturbation[source_dist_idx])
 
+    def _sample_target_dist_idxs(self, source_dist_idx, rng, n_conditions):
+        """Sample multiple target distribution indices given the source distribution index."""
+        available = self._data.control_to_perturbation[source_dist_idx]
+        n_to_sample = min(n_conditions, len(available))
+        return rng.choice(available, size=n_to_sample, replace=False)
+
     def _get_embeddings(self, idx, condition_data) -> dict[str, np.ndarray]:
         """Get embeddings for a given index."""
         result = {}
         for key, arr in condition_data.items():
-            result[key] = np.expand_dims(arr[idx], 0)
+            result[key] = (
+                np.expand_dims(arr[idx], 0)
+                if (np.isscalar(idx) or len(idx) == 0)
+                else arr[idx]
+            )
         return result
 
-    def _sample_from_mask(self, rng, mask) -> np.ndarray:
+    def _get_embeddings_multi(self, idxs, condition_data) -> dict[str, np.ndarray]:
+        """Get embeddings for multiple indices."""
+        result = {}
+        for key, arr in condition_data.items():
+            result[key] = arr[idxs]
+        return result
+
+    def _sample_from_mask(self, rng, mask, size=None) -> np.ndarray:
         """Sample indices according to a mask."""
+        if size is None:
+            size = self.batch_size * self.n_conditions_per_batch
         # Convert mask to probability distribution
         valid_indices = np.where(mask)[0]
 
@@ -78,20 +116,68 @@ class TrainSampler:
         source_batch_idcs = self._sample_from_mask(rng, source_cells_mask)
         source_batch = self._data.cell_data[source_batch_idcs]
 
-        target_dist_idx = self._sample_target_dist_idx(source_dist_idx, rng)
-        target_cells_mask = self._data.perturbation_covariates_mask == target_dist_idx
-        target_batch_idcs = self._sample_from_mask(rng, target_cells_mask)
-        target_batch = self._data.cell_data[target_batch_idcs]
+        if self.n_conditions_per_batch == 1:
+            # Original behavior: single condition
+            target_dist_idx = self._sample_target_dist_idx(source_dist_idx, rng)
+            target_cells_mask = (
+                self._data.perturbation_covariates_mask == target_dist_idx
+            )
+            target_batch_idcs = self._sample_from_mask(rng, target_cells_mask)
+            target_batch = self._data.cell_data[target_batch_idcs]
 
-        if not self._has_condition_data:
-            return {"src_cell_data": source_batch, "tgt_cell_data": target_batch}
+            if not self._has_condition_data:
+                return {"src_cell_data": source_batch, "tgt_cell_data": target_batch}
+            else:
+                condition_batch = self._get_embeddings(
+                    target_dist_idx, self._data.condition_data
+                )
+                return {
+                    "src_cell_data": source_batch,
+                    "tgt_cell_data": target_batch,
+                    "condition": condition_batch,
+                }
         else:
-            condition_batch = self._get_embeddings(target_dist_idx, self._data.condition_data)
-            return {
-                "src_cell_data": source_batch,
-                "tgt_cell_data": target_batch,
-                "condition": condition_batch,
-            }
+            # Multi-condition sampling
+            target_dist_idxs = self._sample_target_dist_idxs(
+                source_dist_idx, rng, self.n_conditions_per_batch
+            )
+            target_cells_mask = np.isin(
+                self._data.perturbation_covariates_mask, target_dist_idxs
+            )
+            target_batch_idcs = self._sample_from_mask(
+                rng,
+                target_cells_mask,
+                size=self.batch_size * self.n_conditions_per_batch,
+            )
+            target_cell_cond_idxs = self._data.perturbation_covariates_mask[
+                target_batch_idcs
+            ]
+            target_batch = self._data.cell_data[target_batch_idcs]
+            # Sample corresponding source cells for this condition
+            source_batch_idcs = self._sample_from_mask(
+                rng,
+                source_cells_mask,
+                size=self.batch_size * self.n_conditions_per_batch,
+            )
+            source_batch = self._data.cell_data[source_batch_idcs]
+
+            if not self._has_condition_data:
+                return {"src_cell_data": source_batch, "tgt_cell_data": target_batch}
+            else:
+                # Repeat each condition embedding for self.batch_size samples
+                condition_batch = self._get_embeddings(
+                    target_cell_cond_idxs, self._data.condition_data
+                )
+                batch = {
+                    "src_cell_data": source_batch,
+                    "tgt_cell_data": target_batch,
+                    "condition": condition_batch,
+                    "condition_idxs": target_cell_cond_idxs,
+                }
+                if self.print_batch:
+                    logger.debug(batch)
+                    self.print_batch = False
+                return batch
 
     @property
     def data(self):
@@ -322,10 +408,21 @@ def prefetch_to_device(
 
 
 class OOCTrainSampler:
+
     def __init__(
-        self, data: TrainingData, seed: int, batch_size: int = 1024, num_workers: int = 4, prefetch_factor: int = 2
+        self,
+        data: TrainingData,
+        seed: int,
+        batch_size: int = 1024,
+        n_conditions_per_batch: int = 1,
+        num_workers: int = 10,
+        prefetch_factor: int = 10,
     ):
-        self.inner = TrainSampler(data=data, batch_size=batch_size)
+        self.inner = TrainSampler(
+            data=data,
+            batch_size=batch_size,
+            n_conditions_per_batch=n_conditions_per_batch,
+        )
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
         self.seed = seed

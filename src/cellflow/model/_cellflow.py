@@ -4,7 +4,7 @@ import types
 from collections.abc import Callable, Sequence
 from dataclasses import field as dc_field
 from typing import Any, Literal
-
+from loguru import logger
 import anndata as ad
 import cloudpickle
 import flax.linen as nn
@@ -31,7 +31,7 @@ from cellflow.plotting import _utils
 from cellflow.solvers import _genot, _otfm
 from cellflow.training._callbacks import BaseCallback
 from cellflow.training._trainer import CellFlowTrainer
-from cellflow.utils import match_linear
+from cellflow.utils import match_linear, labeled_match_linear
 
 __all__ = ["CellFlow"]
 
@@ -245,6 +245,7 @@ class CellFlow:
         # as all conditions need to be the same size
         split_val = len(val_data.control_to_perturbation) > 1
         predict_kwargs = predict_kwargs or {}
+        logger.debug(f"Inside cellflow prep val data: {predict_kwargs}")
         # Check if predict_kwargs is alreday provided from an earlier call
         if "predict_kwargs" in self._validation_data and len(predict_kwargs):
             if self._validation_data["predict_kwargs"] is None:
@@ -296,6 +297,7 @@ class CellFlow:
         layer_norm_before_concatenation: bool = False,
         linear_projection_before_concatenation: bool = False,
         seed=0,
+        sample_multiple_conditions_per_batch: bool = True,
     ) -> None:
         """Prepare the model for training.
 
@@ -514,7 +516,8 @@ class CellFlow:
             raise NotImplementedError(
                 f"The key of `probability_path` must be `'constant_noise'` or `'bridge'` but found {probability_path}."
             )
-
+        if sample_multiple_conditions_per_batch:
+            match_fn = labeled_match_linear
         if self._solver_class == _otfm.OTFlowMatching:
             self._solver = self._solver_class(
                 vf=self.vf,
@@ -600,9 +603,18 @@ class CellFlow:
             )
 
         if out_of_core_dataloading:
-            self._dataloader = OOCTrainSampler(data=self.train_data, batch_size=batch_size)
+            self._dataloader = OOCTrainSampler(
+                data=self.train_data,
+                batch_size=batch_size,
+                n_conditions_per_batch=n_conditions_per_batch,
+                seed=dataloading_seed,
+            )
         else:
-            self._dataloader = TrainSampler(data=self.train_data, batch_size=batch_size)
+            self._dataloader = TrainSampler(
+                data=self.train_data,
+                batch_size=batch_size,
+                n_conditions_per_batch=n_conditions_per_batch,
+            )
         validation_loaders = {
             k: ValidationSampler(v, batch_size=batch_size // 2, seed=dataloading_seed)
             for k, v in self.validation_data.items()

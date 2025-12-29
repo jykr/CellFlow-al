@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 import gc
 from typing import Any, Literal
-
+from loguru import logger
 import jax
 import numpy as np
 from numpy.typing import ArrayLike
