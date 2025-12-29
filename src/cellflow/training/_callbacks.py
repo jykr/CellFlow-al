@@ -1,6 +1,9 @@
 import abc
 from collections.abc import Callable, Sequence
+import json
+import os
 import jax
+import jax.numpy as jnp
 import gc
 from typing import Any, Literal
 from loguru import logger
@@ -502,6 +505,26 @@ class WandbLogger(LoggingCallback):
         self.wandb.log(dict_to_log)
 
 
+class CheckpointCallback(BaseCallback):
+    def __init__(self, checkpoint_dir: str):
+        self.checkpoint_dir = checkpoint_dir.rstrip("/")
+
+    def on_train_begin(self, train_conditions):
+        log_path = f"{self.checkpoint_dir}-train_conditions.json"
+        with open(log_path, "w") as f:
+            json.dump(train_conditions, f)
+
+    def on_log_iteration(self, model, epoch_id: int | None = None):
+        out_dir = f"{self.checkpoint_dir}-epoch{epoch_id}"
+        os.makedirs(out_dir, exist_ok=True)
+        model.save(out_dir, overwrite=True)
+
+    def on_train_end(self, model):
+        out_dir = f"{self.checkpoint_dir}-final"
+        os.makedirs(out_dir, exist_ok=True)
+        model.save(out_dir, overwrite=True)
+
+
 class CallbackRunner:
     """Runs a set of computational and logging callbacks in the :class:`~cellflow.training.CellFlowTrainer`
 
@@ -527,13 +550,16 @@ class CallbackRunner:
         self.logging_callbacks: list[LoggingCallback] = [
             c for c in callbacks if isinstance(c, LoggingCallback)
         ]
+        self.checkpoint_callbacks: list[CheckpointCallback] = [
+            c for c in callbacks if isinstance(c, CheckpointCallback)
+        ]
 
-        if len(self.computation_callbacks) == 0 & len(self.logging_callbacks) != 0:
-            raise ValueError(
-                "No computation callbacks defined to compute metrics to log"
-            )
+        # if len(self.computation_callbacks) == 0 & len(self.logging_callbacks) != 0:
+        #     raise ValueError(
+        #         "No computation callbacks defined to compute metrics to log"
+        #     )
 
-    def on_train_begin(self) -> Any:
+    def on_train_begin(self, train_conditions: List[Any] = None) -> Any:
         """Called at the beginning of training to initiate callbacks"""
         for callback in self.computation_callbacks:
             callback.on_train_begin()
@@ -541,12 +567,21 @@ class CallbackRunner:
         for callback in self.logging_callbacks:
             callback.on_train_begin()
 
+        for callback in self.checkpoint_callbacks:
+            if train_conditions is None:
+                raise ValueError(
+                    "train_conditions must be provided for checkpoint callbacks."
+                )
+            callback.on_train_begin(train_conditions)
+
     def on_log_iteration(
         self,
         valid_source_data: dict[str, dict[str, ArrayLike]],
         valid_data: dict[str, dict[str, ArrayLike]],
         pred_data: dict[str, dict[str, ArrayLike]],
         solver: _otfm.OTFlowMatching | _genot.GENOT,
+        model=None,
+        epoch_id: int | None = None,
     ) -> dict[str, Any]:
         """Called at each validation/log iteration to run callbacks. First computes metrics with computation callbacks and then logs data with logging callbacks.
 
@@ -569,15 +604,20 @@ class CallbackRunner:
         dict_to_log: dict[str, Any] = {}
 
         for callback in self.computation_callbacks:
+            logger.debug(f"Running computation callback: {callback}")
             results = callback.on_log_iteration(
                 valid_source_data, valid_data, pred_data, solver
             )
             dict_to_log.update(results)
             jax.clear_caches()
             gc.collect()
+            logger.debug(f"Done running computation callback: {callback}")
 
         for callback in self.logging_callbacks:
             callback.on_log_iteration(dict_to_log)  # type: ignore[call-arg]
+
+        for callback in self.checkpoint_callbacks:
+            callback.on_log_iteration(model, epoch_id)
 
         return dict_to_log
 
@@ -587,6 +627,7 @@ class CallbackRunner:
         valid_data: dict[str, dict[str, ArrayLike]],
         pred_data: dict[str, dict[str, ArrayLike]],
         solver: _otfm.OTFlowMatching | _genot.GENOT,
+        model=None,
     ) -> dict[str, Any]:
         """Called at the end of training to run callbacks. First computes metrics with computation callbacks and then logs data with logging callbacks.
 
@@ -616,5 +657,8 @@ class CallbackRunner:
 
         for callback in self.logging_callbacks:
             callback.on_train_end(dict_to_log)  # type: ignore[call-arg]
+
+        for callback in self.checkpoint_callbacks:
+            callback.on_train_end(model)
 
         return dict_to_log

@@ -9,7 +9,11 @@ from tqdm import tqdm
 
 from cellflow.data._dataloader import OOCTrainSampler, TrainSampler, ValidationSampler
 from cellflow.solvers import _genot, _otfm
-from cellflow.training._callbacks import BaseCallback, CallbackRunner
+from cellflow.training._callbacks import (
+    BaseCallback,
+    CallbackRunner,
+    ComputationCallback,
+)
 
 
 class CellFlowTrainer:
@@ -39,6 +43,7 @@ class CellFlowTrainer:
         solver: _otfm.OTFlowMatching | _genot.GENOT,
         predict_kwargs: dict[str, Any] | None = None,
         seed: int = 0,
+        model=None,
     ):
         if not isinstance(solver, (_otfm.OTFlowMatching | _genot.GENOT)):
             raise NotImplementedError(
@@ -49,6 +54,7 @@ class CellFlowTrainer:
         self.predict_kwargs = predict_kwargs or {}
         self.rng_subsampling = np.random.default_rng(seed)
         self.training_logs: dict[str, Any] = {}
+        self.model = model
 
     def _validation_step(
         self,
@@ -123,7 +129,13 @@ class CellFlowTrainer:
         crun = CallbackRunner(
             callbacks=callbacks,
         )
-        crun.on_train_begin()
+        if isinstance(dataloader, OOCTrainSampler):
+            train_conditions = (
+                dataloader.inner._data.data_manager.perturbation_covariates
+            )
+        else:
+            train_conditions = dataloader.data_manager.perturbation_covariates
+        crun.on_train_begin(train_conditions=train_conditions)
 
         pbar = tqdm(range(num_iterations))
         sampler = dataloader
@@ -139,13 +151,28 @@ class CellFlowTrainer:
             self.training_logs["loss"].append(float(loss))
             if ((it - 1) % valid_freq == 0) and (it > 1):
                 # Get predictions from validation data
-                valid_source_data, valid_true_data, valid_pred_data = (
-                    self._validation_step(valid_loaders, mode="on_log_iteration")
-                )
+                validate = False
+                if any(
+                    [
+                        isinstance(callback, ComputationCallback)
+                        for callback in callbacks
+                    ]
+                ):
+                    validate = True
+                    valid_source_data, valid_true_data, valid_pred_data = (
+                        self._validation_step(valid_loaders, mode="on_log_iteration")
+                    )
+                else:
+                    valid_source_data = valid_true_data = valid_pred_data = None
 
                 # Run callbacks
-                metrics = crun.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, self.solver)  # type: ignore[arg-type]
-                self._update_logs(metrics)
+                if epoch_length is None:
+                    epoch_length = valid_freq
+
+                metrics = crun.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, self.solver, model=self.model, epoch_id=it // epoch_length)  # type: ignore[arg-type]
+
+                if validate:
+                    self._update_logs(metrics)
                 if metrics["test_sinkhorn_div_mean"] < valid_loss:
                     valid_loss = metrics["test_sinkhorn_div_mean"]
                     waited = 0
@@ -157,14 +184,14 @@ class CellFlowTrainer:
                     gc.collect()
                     break
 
-                # Update progress bar
-                mean_loss = np.mean(self.training_logs["loss"][-valid_freq:])
-                postfix_dict = {
-                    metric: round(self.training_logs[metric][-1], 3)
-                    for metric in monitor_metrics
-                }
-                postfix_dict["loss"] = round(mean_loss, 3)
-                pbar.set_postfix(postfix_dict)
+                    # Update progress bar
+                    mean_loss = np.mean(self.training_logs["loss"][-valid_freq:])
+                    postfix_dict = {
+                        metric: round(self.training_logs[metric][-1], 3)
+                        for metric in monitor_metrics
+                    }
+                    postfix_dict["loss"] = round(mean_loss, 3)
+                    pbar.set_postfix(postfix_dict)
                 jax.clear_caches()
                 gc.collect()
 
@@ -173,7 +200,11 @@ class CellFlowTrainer:
                 valid_loaders, mode="on_train_end"
             )
             metrics = crun.on_train_end(
-                valid_source_data, valid_true_data, valid_pred_data, self.solver
+                valid_source_data,
+                valid_true_data,
+                valid_pred_data,
+                self.solver,
+                model=self.model,
             )
             self._update_logs(metrics)
 
