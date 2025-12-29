@@ -776,12 +776,25 @@ class CellFlow:
             if file_prefix is not None
             else f"{self.__class__.__name__}.pkl"
         )
-        file_dir = os.path.join(dir_path, file_name) if dir_path is not None else file_name
+        file_dir = (
+            os.path.join(dir_path, file_name) if dir_path is not None else file_name
+        )
 
         if not overwrite and os.path.exists(file_dir):
-            raise RuntimeError(f"Unable to save to an existing file `{file_dir}` use `overwrite=True` to overwrite it.")
-        with open(file_dir, "wb") as f:
-            cloudpickle.dump(self, f)
+            raise RuntimeError(
+                f"Unable to save to an existing file `{file_dir}` use `overwrite=True` to overwrite it."
+            )
+
+        # Clear generator from OOCTrainSampler before pickling (generators can't be pickled)
+        if isinstance(self._dataloader, OOCTrainSampler):
+            generator = self._dataloader._iterator
+            self._dataloader._iterator = None
+            with open(file_dir, "wb") as f:
+                cloudpickle.dump(self, f)
+            self._dataloader._iterator = generator
+        else:
+            with open(file_dir, "wb") as f:
+                cloudpickle.dump(self, f)
 
     @classmethod
     def load(

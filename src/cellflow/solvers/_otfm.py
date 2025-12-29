@@ -49,7 +49,9 @@ class OTFlowMatching:
         vf: ConditionalVelocityField,
         probability_path: dynamics.BaseFlow,
         match_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
-        time_sampler: Callable[[jax.Array, int], jnp.ndarray] = solver_utils.uniform_sampler,
+        time_sampler: Callable[
+            [jax.Array, int], jnp.ndarray
+        ] = solver_utils.uniform_sampler,
         **kwargs: Any,
     ):
         self._is_trained: bool = False
@@ -61,8 +63,12 @@ class OTFlowMatching:
         self.match_fn = jax.jit(match_fn)
         self.ema = kwargs.pop("ema", 1.0)
 
-        self.vf_state = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
-        self.vf_state_inference = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
+        self.vf_state = self.vf.create_train_state(
+            input_dim=self.vf.output_dims[-1], **kwargs
+        )
+        self.vf_state_inference = self.vf.create_train_state(
+            input_dim=self.vf.output_dims[-1], **kwargs
+        )
         self.vf_step_fn = self._get_vf_step_fn()
 
     def _get_vf_step_fn(self) -> Callable:  # type: ignore[type-arg]
@@ -98,17 +104,25 @@ class OTFlowMatching:
                 u_t = self.probability_path.compute_ut(t, x_t, source, target)
                 flow_matching_loss = jnp.mean((v_t - u_t) ** 2)
                 condition_mean_regularization = 0.5 * jnp.mean(mean_cond**2)
-                condition_var_regularization = -0.5 * jnp.mean(1 + logvar_cond - jnp.exp(logvar_cond))
+                condition_var_regularization = -0.5 * jnp.mean(
+                    1 + logvar_cond - jnp.exp(logvar_cond)
+                )
                 if self.condition_encoder_mode == "stochastic":
-                    encoder_loss = condition_mean_regularization + condition_var_regularization
-                elif (self.condition_encoder_mode == "deterministic") and (self.condition_encoder_regularization > 0):
+                    encoder_loss = (
+                        condition_mean_regularization + condition_var_regularization
+                    )
+                elif (self.condition_encoder_mode == "deterministic") and (
+                    self.condition_encoder_regularization > 0
+                ):
                     encoder_loss = condition_mean_regularization
                 else:
                     encoder_loss = 0.0
                 return flow_matching_loss + encoder_loss
 
             grad_fn = jax.value_and_grad(loss_fn)
-            loss, grads = grad_fn(vf_state.params, time, source, target, conditions, encoder_noise, rng)
+            loss, grads = grad_fn(
+                vf_state.params, time, source, target, conditions, encoder_noise, rng
+            )
             return vf_state.apply_gradients(grads=grads), loss
 
         return vf_step_fn
@@ -134,10 +148,14 @@ class OTFlowMatching:
         """
         src, tgt = batch["src_cell_data"], batch["tgt_cell_data"]
         condition = batch.get("condition")
-        rng_resample, rng_time, rng_step_fn, rng_encoder_noise = jax.random.split(rng, 4)
+        rng_resample, rng_time, rng_step_fn, rng_encoder_noise = jax.random.split(
+            rng, 4
+        )
         n = src.shape[0]
         time = self.time_sampler(rng_time, n)
-        encoder_noise = jax.random.normal(rng_encoder_noise, (n, self.vf.condition_embedding_dim))
+        encoder_noise = jax.random.normal(
+            rng_encoder_noise, (n, self.vf.condition_embedding_dim)
+        )
         # TODO: test whether it's better to sample the same noise for all samples or different ones
 
         if self.match_fn is not None:
@@ -159,11 +177,15 @@ class OTFlowMatching:
             self.vf_state_inference = self.vf_state
         else:
             self.vf_state_inference = self.vf_state_inference.replace(
-                params=ema_update(self.vf_state_inference.params, self.vf_state.params, self.ema)
+                params=ema_update(
+                    self.vf_state_inference.params, self.vf_state.params, self.ema
+                )
             )
         return loss
 
-    def get_condition_embedding(self, condition: dict[str, ArrayLike], return_as_numpy=True) -> ArrayLike:
+    def get_condition_embedding(
+        self, condition: dict[str, ArrayLike], return_as_numpy=True
+    ) -> ArrayLike:
         """Get learnt embeddings of the conditions.
 
         Parameters
@@ -187,7 +209,11 @@ class OTFlowMatching:
         return cond_mean, cond_logvar
 
     def _predict_jit(
-        self, x: ArrayLike, condition: dict[str, ArrayLike], rng: jax.Array | None = None, **kwargs: Any
+        self,
+        x: ArrayLike,
+        condition: dict[str, ArrayLike],
+        rng: jax.Array | None = None,
+        **kwargs: Any,
     ) -> ArrayLike:
         """See :meth:`OTFlowMatching.predict`."""
         kwargs.setdefault("dt0", None)
@@ -198,14 +224,26 @@ class OTFlowMatching:
         noise_dim = (1, self.vf.condition_embedding_dim)
         use_mean = rng is None or self.condition_encoder_mode == "deterministic"
         rng = utils.default_prng_key(rng)
-        encoder_noise = jnp.zeros(noise_dim) if use_mean else jax.random.normal(rng, noise_dim)
+        encoder_noise = (
+            jnp.zeros(noise_dim) if use_mean else jax.random.normal(rng, noise_dim)
+        )
 
-        def vf(t: jnp.ndarray, x: jnp.ndarray, args: tuple[dict[str, jnp.ndarray], jnp.ndarray]) -> jnp.ndarray:
+        def vf(
+            t: jnp.ndarray,
+            x: jnp.ndarray,
+            args: tuple[dict[str, jnp.ndarray], jnp.ndarray],
+        ) -> jnp.ndarray:
             params = self.vf_state_inference.params
             condition, encoder_noise = args
-            return self.vf_state_inference.apply_fn({"params": params}, t, x, condition, encoder_noise, train=False)[0]
+            return self.vf_state_inference.apply_fn(
+                {"params": params}, t, x, condition, encoder_noise, train=False
+            )[0]
 
-        def solve_ode(x: jnp.ndarray, condition: dict[str, jnp.ndarray], encoder_noise: jnp.ndarray) -> jnp.ndarray:
+        def solve_ode(
+            x: jnp.ndarray,
+            condition: dict[str, jnp.ndarray],
+            encoder_noise: jnp.ndarray,
+        ) -> jnp.ndarray:
             ode_term = diffrax.ODETerm(vf)
             result = diffrax.diffeqsolve(
                 ode_term,
@@ -217,7 +255,9 @@ class OTFlowMatching:
             )
             return result.ys[0]
 
-        x_pred = jax.jit(jax.vmap(solve_ode, in_axes=[0, None, None]))(x, condition, encoder_noise)
+        x_pred = jax.jit(jax.vmap(solve_ode, in_axes=[0, None, None]))(
+            x, condition, encoder_noise
+        )
         return x_pred
 
     def predict(
@@ -263,16 +303,24 @@ class OTFlowMatching:
         if batched:
             keys = sorted(x.keys())
             condition_keys = sorted(set().union(*(condition[k].keys() for k in keys)))
-            _predict_jit = jax.jit(lambda x, condition: self._predict_jit(x, condition, rng, **kwargs))
-            batched_predict = jax.vmap(_predict_jit, in_axes=(0, dict.fromkeys(condition_keys, 0)))
+            _predict_jit = jax.jit(
+                lambda x, condition: self._predict_jit(x, condition, rng, **kwargs)
+            )
+            batched_predict = jax.vmap(
+                _predict_jit, in_axes=(0, dict.fromkeys(condition_keys, 0))
+            )
             # assert that the number of cells is the same for each condition
             n_cells = x[keys[0]].shape[0]
             for k in keys:
-                assert x[k].shape[0] == n_cells, "The number of cells must be the same for each condition"
+                assert (
+                    x[k].shape[0] == n_cells
+                ), "The number of cells must be the same for each condition"
             src_inputs = jnp.stack([x[k] for k in keys], axis=0)
             batched_conditions = {}
             for cond_key in condition_keys:
-                batched_conditions[cond_key] = jnp.stack([condition[k][cond_key] for k in keys])
+                batched_conditions[cond_key] = jnp.stack(
+                    [condition[k][cond_key] for k in keys]
+                )
 
             pred_targets = batched_predict(src_inputs, batched_conditions)
             return {k: pred_targets[i] for i, k in enumerate(keys)}

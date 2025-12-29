@@ -3,10 +3,11 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
-
+import requests
+from tqdm.auto import tqdm
 import anndata as ad
 import pandas as pd
-
+from loguru import logger
 from cellflow._logging import logger
 
 try:
@@ -84,7 +85,9 @@ class GeneInfo:
         if self.canonical_transcript_info:
             self.transcript_id = self.canonical_transcript_info["transcript_id"]
             self.display_name = self.canonical_transcript_info["display_name"]
-            self._is_protein_coding = self.canonical_transcript_info["biotype"] == "protein_coding"
+            self._is_protein_coding = (
+                self.canonical_transcript_info["biotype"] == "protein_coding"
+            )
 
     @property
     def is_protein_coding(self) -> bool:
@@ -116,27 +119,32 @@ def prot_sequence_from_ensembl(ensembl_gene_id: list[str]) -> pd.DataFrame:
     ]
     df = pd.DataFrame(columns=columns)
     for gene_id in ensembl_gene_id:
-        gene_info = GeneInfo(gene_id)
-        results[gene_id] = gene_info.protein_sequence
-        data = [
-            [
-                gene_id,
-                gene_info.transcript_id,
-                gene_info.display_name,
-                gene_info.is_protein_coding,
-                gene_info.seq_len,
-                gene_info.protein_sequence,
+        try:
+            gene_info = GeneInfo(gene_id)
+            results[gene_id] = gene_info.protein_sequence
+            data = [
+                [
+                    gene_id,
+                    gene_info.transcript_id,
+                    gene_info.display_name,
+                    gene_info.is_protein_coding,
+                    gene_info.seq_len,
+                    gene_info.protein_sequence,
+                ]
             ]
-        ]
-        df_iter = pd.DataFrame(data, columns=columns)
-        df = pd.concat([df, df_iter])
+            df_iter = pd.DataFrame(data, columns=columns)
+            df = pd.concat([df, df_iter])
+        except requests.exceptions.HTTPError:
+            missing_ids.append(gene_id)
 
     if missing_ids:
         logger.info(f"Missing sequence for ids: {set(missing_ids)}")
     return df
 
 
-def order_to_batch_list(unordered_list: list[Any], batch_idx: list[list[int]]) -> list[list[Any]]:
+def order_to_batch_list(
+    unordered_list: list[Any], batch_idx: list[list[int]]
+) -> list[list[Any]]:
     ordered_list = []
     for batch in batch_idx:
         batch_iter = [unordered_list[i] for i in batch]
@@ -157,7 +165,9 @@ class BatchedDataset:
     def __getitem__(self, idx):
         return self.sequence_labels[idx], self.sequence_strs[idx]
 
-    def get_batch_indices(self, toks_per_batch, extra_toks_per_seq=0) -> list[list[int]]:
+    def get_batch_indices(
+        self, toks_per_batch, extra_toks_per_seq=0
+    ) -> list[list[int]]:
         sizes = [(len(s), i) for i, s in enumerate(self.sequence_strs)]
         sizes.sort()
         batches = []
@@ -221,9 +231,13 @@ def _get_esm_collate_fn(
     return collate_fn
 
 
-def get_model_and_tokenizer(model_name: str, use_cuda: bool, cache_dir: None | str) -> tuple[EsmModel, AutoTokenizer]:
+def get_model_and_tokenizer(
+    model_name: str, use_cuda: bool, cache_dir: None | str
+) -> tuple[EsmModel, AutoTokenizer]:
     model_path = os.path.join("facebook", model_name)
-    model = EsmModel.from_pretrained(model_path, cache_dir=cache_dir, add_pooling_layer=False)
+    model = EsmModel.from_pretrained(
+        model_path, cache_dir=cache_dir, add_pooling_layer=False
+    )
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=cache_dir)
     if use_cuda:
@@ -274,21 +288,25 @@ def protein_features_from_genes(
     metadata = prot_sequence_from_ensembl(genes)
     to_emb = metadata[metadata.protein_sequence.notnull()]
     use_cuda = use_cuda and torch.cuda.is_available()
+    logger.info("getting model and tokenizer")
     esm, tokenizer = get_model_and_tokenizer(esm_model_name, use_cuda, cache_dir)
+    logger.info("Creating dataloader")
     data_loader = create_dataloader(
         prot_names=to_emb["gene_id"].to_list(),
         sequences=to_emb["protein_sequence"].to_list(),
         toks_per_batch=toks_per_batch,
-        collate_fn=_get_esm_collate_fn(tokenizer, max_length=trunc_len, truncation=truncation, return_tensors="pt"),
+        collate_fn=_get_esm_collate_fn(
+            tokenizer, max_length=trunc_len, truncation=truncation, return_tensors="pt"
+        ),
     )
     results = {}
-    for batch_metadata, batch in data_loader:
+    for batch_metadata, batch in tqdm(data_loader):
         if use_cuda:
             batch = {k: v.cuda() for k, v in batch.items()}
         batch_results = esm(**batch).last_hidden_state
         for i, name in enumerate(batch_metadata["gene_id"]):
             trunc_len = min(trunc_len, len(batch_metadata["protein_sequence"][i]))  # type: ignore[type-var]
-            emb = batch_results[i, 1 : trunc_len + 1].mean(0).clone()  # type: ignore[operator]
+            emb = batch_results[i, 1 : trunc_len + 1].mean(0).detach().cpu().numpy()  # type: ignore[operator]
             results[name] = emb
     return results, metadata
 

@@ -68,7 +68,9 @@ class ConditionEncoder(nn_utils.BaseModule):
     pooling: Literal["mean", "attention_token", "attention_seed"] = "attention_token"
     pooling_kwargs: dict[str, Any] = dc_field(default_factory=lambda: {})
     covariates_not_pooled: Sequence[str] = dc_field(default_factory=list)
-    layers_before_pool: Layers_t | Layers_separate_input_t = dc_field(default_factory=lambda: [])
+    layers_before_pool: Layers_t | Layers_separate_input_t = dc_field(
+        default_factory=lambda: []
+    )
     layers_after_pool: Layers_t = dc_field(default_factory=lambda: [])
     layers_decoder: Layers_t = dc_field(default_factory=lambda: [])
     output_dropout: float = 0.0
@@ -96,10 +98,14 @@ class ConditionEncoder(nn_utils.BaseModule):
             self.pool_module = nn_utils.SeedAttentionPooling(**self.pooling_kwargs)
 
         # modules after pooling
-        self.after_pool_modules_mean = nn_utils._get_layers(self.layers_after_pool, self.output_dim)
+        self.after_pool_modules_mean = nn_utils._get_layers(
+            self.layers_after_pool, self.output_dim
+        )
 
         if self.condition_mode == "stochastic":
-            self.after_pool_modules_var = nn_utils._get_layers(self.layers_after_pool, self.output_dim)
+            self.after_pool_modules_var = nn_utils._get_layers(
+                self.layers_after_pool, self.output_dim
+            )
 
     def __call__(
         self,
@@ -128,6 +134,7 @@ class ConditionEncoder(nn_utils.BaseModule):
             processed_inputs_other = []
             for pert_cov, conditions_i in conditions.items():
                 # apply separate modules for all inputs
+                # conditions_i.shape == (batch_size, set_size, condition_dim)
                 conditions_i = nn_utils._apply_modules(
                     self.before_pool_modules[pert_cov],  # type: ignore[call-overload]
                     conditions_i,
@@ -142,7 +149,9 @@ class ConditionEncoder(nn_utils.BaseModule):
 
             conditions_pooling_arr = jnp.concatenate(processed_inputs_pooling, axis=-1)
             conditions_not_pooled = (
-                jnp.concatenate(processed_inputs_other, axis=-1) if self.covariates_not_pooled else None
+                jnp.concatenate(processed_inputs_other, axis=-1)
+                if self.covariates_not_pooled
+                else None
             )
         else:
             # by default, no modules before pooling for covariates that are not pooled
@@ -182,15 +191,21 @@ class ConditionEncoder(nn_utils.BaseModule):
 
         # pooling
         pool_mask = mask if self.pooling == "mean" else attention_mask
-        conditions = self.pool_module(conditions_pooling_arr, pool_mask, training=training)
+        conditions = self.pool_module(
+            conditions_pooling_arr, pool_mask, training=training
+        )
         if self.covariates_not_pooled:
             conditions = jnp.concatenate([conditions, conditions_not_pooled], axis=-1)
 
         # apply modules after pooling
-        conditions = nn_utils._apply_modules(self.after_pool_modules_mean, conditions, None, training)
+        conditions = nn_utils._apply_modules(
+            self.after_pool_modules_mean, conditions, None, training
+        )
 
         if self.condition_mode == "stochastic":
-            conditions_logvar = nn_utils._apply_modules(self.after_pool_modules_var, conditions, None, training)
+            conditions_logvar = nn_utils._apply_modules(
+                self.after_pool_modules_var, conditions, None, training
+            )
         else:
             conditions_logvar = jnp.zeros_like(conditions)
         return conditions, conditions_logvar
@@ -205,7 +220,9 @@ class ConditionEncoder(nn_utils.BaseModule):
         """Create initial training state."""
         params = self.init(
             rng,
-            conditions={k: jnp.empty((1, v.shape[1], v.shape[2])) for k, v in conditions.items()},
+            conditions={
+                k: jnp.empty((1, v.shape[1], v.shape[2])) for k, v in conditions.items()
+            },
             training=False,
         )["params"]
         return train_state.TrainState.create(
@@ -215,7 +232,9 @@ class ConditionEncoder(nn_utils.BaseModule):
             **kwargs,
         )
 
-    def _get_masks(self, conditions: dict[str, ArrayLike]) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def _get_masks(
+        self, conditions: dict[str, ArrayLike]
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Get mask for padded conditions tensor."""
         # mask of shape (batch_size, set_size)
         mask = 1 - jnp.all(

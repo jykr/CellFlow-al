@@ -15,7 +15,7 @@ def match_linear(
     source_batch: jnp.ndarray,
     target_batch: jnp.ndarray,
     cost_fn: costs.CostFn | None = costs.SqEuclidean(),
-    epsilon: float | None = 1.0,
+    epsilon: float | None = None,
     scale_cost: ScaleCost_t = "mean",
     tau_a: float = 1.0,
     tau_b: float = 1.0,
@@ -64,6 +64,96 @@ def match_linear(
     solver = sinkhorn.Sinkhorn(threshold=threshold, **kwargs)
     out = solver(problem)
     return out.matrix
+
+
+def labeled_match_linear(
+    source_batch: jnp.ndarray,
+    target_batch: jnp.ndarray,
+    source_labels: jnp.ndarray,
+    target_labels: jnp.ndarray,
+    cost_fn: costs.CostFn | None = costs.SqEuclidean(),
+    epsilon: float | None = None,
+    scale_cost: ScaleCost_t = "mean",
+    tau_a: float = 1.0,
+    tau_b: float = 1.0,
+    threshold: float | None = None,
+    **kwargs: Any,
+) -> jnp.ndarray:
+    """Compute solution to a linear OT problem with label constraints.
+
+    Only matches samples with the same label. This is achieved by setting
+    the cost to infinity for pairs with different labels. This version is
+    fully jittable.
+
+    Parameters
+    ----------
+    source_batch
+        Source point cloud of shape ``[n, d]``.
+    target_batch
+        Target point cloud of shape ``[m, d]``.
+    source_labels
+        Labels for source samples of shape ``[n,]``.
+    target_labels
+        Labels for target samples of shape ``[m,]``.
+        Number of unique labels (unused, kept for API compatibility).
+    cost_fn
+        Cost function to use for the linear OT problem.
+    epsilon
+        Regularization parameter.
+    scale_cost
+        Scaling of the cost matrix.
+    tau_a
+        Parameter in :math:`(0, 1]` that defines how unbalanced the problem is
+        in the source distribution. If :math:`1`, the problem is balanced in the source distribution.
+    tau_b
+        Parameter in :math:`(0, 1]` that defines how unbalanced the problem is in the target
+        distribution. If :math:`1`, the problem is balanced in the target distribution.
+    threshold
+        Convergence criterion for the Sinkhorn algorithm.
+    kwargs
+        Additional arguments for :class:`ott.solvers.linear.sinkhorn.Sinkhorn`.
+
+    Returns
+    -------
+    Optimal transport matrix between ``'source_batch'`` and ``'target_batch'``.
+    """
+    if threshold is None:
+        threshold = 1e-3 if (tau_a == 1.0 and tau_b == 1.0) else 1e-2
+
+    # Create label mask: True where labels match, False otherwise
+    # Shape: [n, m]
+    label_match_mask = source_labels[:, None] == target_labels[None, :]
+
+    # Compute base geometry
+    geom = pointcloud.PointCloud(
+        source_batch,
+        target_batch,
+        cost_fn=cost_fn,
+        epsilon=epsilon,
+        scale_cost=scale_cost,
+    )
+    # Get cost matrix and set non-matching pairs to large value
+    # Use a large but finite value to avoid numerical issues
+    cost_matrix = geom.cost_matrix
+    # get stddev of masked cost
+    masked_cost_std = jnp.std(jnp.where(label_match_mask, cost_matrix, 0.0))
+    epsilon = 0.05 * masked_cost_std
+    masked_cost = jnp.where(label_match_mask, cost_matrix, 1e9)
+
+    # Create new geometry with masked costs
+    from ott.geometry import geometry
+
+    masked_geom = geometry.Geometry(
+        cost_matrix=masked_cost,
+        epsilon=epsilon,
+    )
+
+    problem = linear_problem.LinearProblem(masked_geom, tau_a=tau_a, tau_b=tau_b)
+    solver = sinkhorn.Sinkhorn(threshold=threshold, **kwargs)
+    out = solver(problem)
+
+    # Zero out any residual transport between non-matching labels
+    return jnp.where(label_match_mask, out.matrix, 0.0)
 
 
 def default_prng_key(rng: jax.Array | None) -> jax.Array:

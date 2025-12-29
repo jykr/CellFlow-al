@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-
+import gc
 import jax
 import numpy as np
 from jax import numpy as jnp
@@ -39,7 +39,7 @@ def compute_r_squared(x: ArrayLike, y: ArrayLike) -> float:
     return r2_score(np.mean(x, axis=0), np.mean(y, axis=0))
 
 
-def compute_sinkhorn_div(x: ArrayLike, y: ArrayLike, epsilon: float = 1e-2) -> float:
+def compute_sinkhorn_div(x: ArrayLike, y: ArrayLike, epsilon: float = None) -> float:
     """Compute the Sinkhorn divergence between x and y as in :cite:`feydy:19`.
 
     Parameters
@@ -55,16 +55,17 @@ def compute_sinkhorn_div(x: ArrayLike, y: ArrayLike, epsilon: float = 1e-2) -> f
     -------
         A scalar denoting the sinkhorn divergence value.
     """
-    return float(
-        sinkhorn_divergence(
-            pointcloud.PointCloud,
-            x=x,
-            y=y,
-            cost_fn=costs.SqEuclidean(),
-            epsilon=epsilon,
-            scale_cost=1.0,
-        )[0]
-    )
+    res = sinkhorn_divergence(
+        pointcloud.PointCloud,
+        x=x,
+        y=y,
+        cost_fn=costs.SqEuclidean(),
+        epsilon=epsilon,
+        scale_cost=1.0,
+    )[0]
+    jax.clear_caches()
+    gc.collect()
+    return res
 
 
 def compute_e_distance(
