@@ -71,7 +71,8 @@ class CellFlowTrainer:
         valid_pred_data: dict[str, dict[str, ArrayLike]] = {}
         valid_true_data: dict[str, dict[str, ArrayLike]] = {}
         for val_key, vdl in val_data.items():
-            batch = vdl.sample(mode=mode)
+            batch = vdl.sample(mode=mode, rng=self.rng_subsampling)
+            batch = jax.device_put(batch, jax.devices()[0])
             src = batch["source"]
             condition = batch.get("condition", None)
             true_tgt = batch["target"]

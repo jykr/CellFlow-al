@@ -18,7 +18,12 @@ from ott.neural.methods.flows import dynamics
 from cellflow import _constants
 from cellflow._types import ArrayLike, Layers_separate_input_t, Layers_t
 from cellflow.data._data import ConditionData, TrainingData, ValidationData
-from cellflow.data._dataloader import OOCTrainSampler, PredictionSampler, TrainSampler, ValidationSampler
+from cellflow.data._dataloader import (
+    OOCTrainSampler,
+    PredictionSampler,
+    TrainSampler,
+    ValidationSampler,
+)
 from cellflow.data._datamanager import DataManager
 from cellflow.model._utils import _write_predictions
 from cellflow.networks import _velocity_field
@@ -59,7 +64,11 @@ class CellFlow:
         self._validation_data: dict[str, ValidationData] = {"predict_kwargs": {}}
         self._solver: _otfm.OTFlowMatching | _genot.GENOT | None = None
         self._condition_dim: int | None = None
-        self._vf: _velocity_field.ConditionalVelocityField | _velocity_field.GENOTConditionalVelocityField | None = None
+        self._vf: (
+            _velocity_field.ConditionalVelocityField
+            | _velocity_field.GENOTConditionalVelocityField
+            | None
+        ) = None
 
     def prepare_data(
         self,
@@ -238,7 +247,11 @@ class CellFlow:
         predict_kwargs = predict_kwargs or {}
         # Check if predict_kwargs is alreday provided from an earlier call
         if "predict_kwargs" in self._validation_data and len(predict_kwargs):
-            predict_kwargs = self._validation_data["predict_kwargs"].update(predict_kwargs)
+            if self._validation_data["predict_kwargs"] is None:
+                self._validation_data["predict_kwargs"] = {}
+            predict_kwargs = self._validation_data["predict_kwargs"].update(
+                predict_kwargs
+            )
         # Set batched prediction to False if split_val is True
         if split_val:
             predict_kwargs["batched"] = False
@@ -586,7 +599,11 @@ class CellFlow:
             self._dataloader = OOCTrainSampler(data=self.train_data, batch_size=batch_size)
         else:
             self._dataloader = TrainSampler(data=self.train_data, batch_size=batch_size)
-        validation_loaders = {k: ValidationSampler(v) for k, v in self.validation_data.items() if k != "predict_kwargs"}
+        validation_loaders = {
+            k: ValidationSampler(v, batch_size=batch_size // 2, seed=dataloading_seed)
+            for k, v in self.validation_data.items()
+            if k != "predict_kwargs"
+        }
 
         self._solver = self.trainer.train(
             dataloader=self._dataloader,

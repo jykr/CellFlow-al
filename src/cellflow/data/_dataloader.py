@@ -55,7 +55,7 @@ class TrainSampler:
             raise ValueError("No valid indices found in the mask")
 
         # Sample from valid indices with equal probability
-        batch_idcs = rng.choice(valid_indices, self.batch_size, replace=True)
+        batch_idcs = rng.choice(valid_indices, size, replace=True)
         return batch_idcs
 
     def sample(self, rng) -> dict[str, Any]:
@@ -63,8 +63,8 @@ class TrainSampler:
 
         Parameters
         ----------
-        seed : int, optional
-            Random seed
+        rng
+            Random number generator
 
         Returns
         -------
@@ -110,7 +110,9 @@ class BaseValidSampler(abc.ABC):
         cov_combination = self._data.perturbation_idx_to_covariates[cond_idx]  # type: ignore[attr-defined]
         return tuple(cov_combination[i] for i in range(len(cov_combination)))
 
-    def _get_perturbation_to_control(self, data: ValidationData | PredictionData) -> dict[int, np.ndarray]:
+    def _get_perturbation_to_control(
+        self, data: ValidationData | PredictionData
+    ) -> dict[int, np.ndarray]:
         d = {}
         for k, v in data.control_to_perturbation.items():
             for el in v:
@@ -128,12 +130,17 @@ class ValidationSampler(BaseValidSampler):
     ----------
     val_data
         The validation data.
+    batch_size
+        Number of samples to draw per condition.
     seed
         Random seed.
     """
 
-    def __init__(self, val_data: ValidationData, seed: int = 0) -> None:
+    def __init__(
+        self, val_data: ValidationData, batch_size: int = 1024, seed: int = 0
+    ) -> None:
         self._data = val_data
+        self.batch_size = batch_size
         self.perturbation_to_control = self._get_perturbation_to_control(val_data)
         self.n_conditions_on_log_iteration = (
             val_data.n_conditions_on_log_iteration
@@ -145,11 +152,23 @@ class ValidationSampler(BaseValidSampler):
             if val_data.n_conditions_on_train_end is not None
             else val_data.n_perturbations
         )
-        self.rng = np.random.default_rng(seed)
+        self.seed = seed
         if self._data.condition_data is None:
             raise NotImplementedError("Validation data must have condition data.")
 
-    def sample(self, mode: Literal["on_log_iteration", "on_train_end"]) -> Any:
+    def _sample_from_indices(
+        self, rng: np.random.Generator, indices: np.ndarray
+    ) -> np.ndarray:
+        """Sample batch_size indices from a set of valid indices."""
+        if len(indices) <= self.batch_size:
+            return indices
+        return rng.choice(indices, size=self.batch_size, replace=False)
+
+    def sample(
+        self,
+        mode: Literal["on_log_iteration", "on_train_end"],
+        rng: np.random.Generator,
+    ) -> Any:
         """Sample data for validation.
 
         Parameters
@@ -161,23 +180,39 @@ class ValidationSampler(BaseValidSampler):
         -------
         Dictionary with source, condition, and target data from the validation data.
         """
-        size = self.n_conditions_on_log_iteration if mode == "on_log_iteration" else self.n_conditions_on_train_end
-        condition_idcs = self.rng.choice(self._data.n_perturbations, size=(size,), replace=False)
+        size = (
+            self.n_conditions_on_log_iteration
+            if mode == "on_log_iteration"
+            else self.n_conditions_on_train_end
+        )
+        condition_idcs = rng.choice(
+            self._data.n_perturbations, size=(size,), replace=False
+        )
 
-        source_idcs = [self.perturbation_to_control[cond_idx] for cond_idx in condition_idcs]
-        source_cells_mask = [self._data.split_covariates_mask == source_idx for source_idx in source_idcs]
-        source_cells = [self._data.cell_data[mask] for mask in source_cells_mask]
-        target_cells_mask = [cond_idx == self._data.perturbation_covariates_mask for cond_idx in condition_idcs]
-        target_cells = [self._data.cell_data[mask] for mask in target_cells_mask]
-        conditions = [self._get_condition_data(cond_idx) for cond_idx in condition_idcs]
         cell_rep_dict = {}
         cond_dict = {}
         true_dict = {}
-        for i in range(len(condition_idcs)):
-            k = self._get_key(condition_idcs[i])
-            cell_rep_dict[k] = source_cells[i]
-            cond_dict[k] = conditions[i]
-            true_dict[k] = target_cells[i]
+
+        for cond_idx in condition_idcs:
+            k = self._get_key(cond_idx)
+
+            # Get source cells for this condition
+            source_idx = self.perturbation_to_control[cond_idx]
+            source_valid_indices = np.where(
+                self._data.split_covariates_mask == source_idx
+            )[0]
+            source_sample_indices = self._sample_from_indices(rng, source_valid_indices)
+            cell_rep_dict[k] = self._data.cell_data[source_sample_indices]
+
+            # Get target cells for this condition
+            target_valid_indices = np.where(
+                self._data.perturbation_covariates_mask == cond_idx
+            )[0]
+            target_sample_indices = self._sample_from_indices(rng, target_valid_indices)
+            true_dict[k] = self._data.cell_data[target_sample_indices]
+
+            # Get condition data
+            cond_dict[k] = self._get_condition_data(cond_idx)
 
         return {"source": cell_rep_dict, "condition": cond_dict, "target": true_dict}
 
@@ -212,8 +247,12 @@ class PredictionSampler(BaseValidSampler):
         """
         condition_idcs = range(self._data.n_perturbations)
 
-        source_idcs = [self.perturbation_to_control[cond_idx] for cond_idx in condition_idcs]
-        source_cells_mask = [self._data.split_covariates_mask == source_idx for source_idx in source_idcs]
+        source_idcs = [
+            self.perturbation_to_control[cond_idx] for cond_idx in condition_idcs
+        ]
+        source_cells_mask = [
+            self._data.split_covariates_mask == source_idx for source_idx in source_idcs
+        ]
         source_cells = [self._data.cell_data[mask] for mask in source_cells_mask]
         conditions = [self._get_condition_data(cond_idx) for cond_idx in condition_idcs]
         cell_rep_dict = {}
@@ -235,7 +274,11 @@ class PredictionSampler(BaseValidSampler):
 
 
 def prefetch_to_device(
-    sampler: TrainSampler, seed: int, num_iterations: int, prefetch_factor: int = 2, num_workers: int = 4
+    sampler: TrainSampler,
+    seed: int,
+    num_iterations: int,
+    prefetch_factor: int = 10,
+    num_workers: int = 10,
 ) -> Generator[dict[str, Any], None, None]:
     seq = np.random.SeedSequence(seed)
     random_generators = [np.random.default_rng(s) for s in seq.spawn(num_workers)]
@@ -261,7 +304,9 @@ def prefetch_to_device(
     # Start multiple worker threads
     ts = []
     for i in range(num_workers):
-        t = threading.Thread(target=worker, daemon=True, name=f"worker-{i}", args=(random_generators[i],))
+        t = threading.Thread(
+            target=worker, daemon=True, name=f"worker-{i}", args=(random_generators[i],)
+        )
         t.start()
         ts.append(t)
 
@@ -288,7 +333,11 @@ class OOCTrainSampler:
 
     def set_sampler(self, num_iterations: int) -> None:
         self._iterator = prefetch_to_device(
-            sampler=self.inner, seed=self.seed, num_iterations=num_iterations, prefetch_factor=self.prefetch_factor
+            sampler=self.inner,
+            seed=self.seed,
+            num_iterations=num_iterations,
+            prefetch_factor=self.prefetch_factor,
+            num_workers=self.num_workers,
         )
 
     def sample(self, rng=None) -> dict[str, Any]:
