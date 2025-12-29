@@ -99,6 +99,9 @@ class CellFlowTrainer:
         valid_loaders: dict[str, ValidationSampler] | None = None,
         monitor_metrics: Sequence[str] = [],
         callbacks: Sequence[BaseCallback] = [],
+        profile=False,
+        early_stopping=True,
+        epoch_length: int | None = None,
     ) -> _otfm.OTFlowMatching | _genot.GENOT:
         """Trains the model.
 
@@ -142,14 +145,32 @@ class CellFlowTrainer:
         sampler = dataloader
         if isinstance(dataloader, OOCTrainSampler):
             dataloader.set_sampler(num_iterations=num_iterations)
-        valid_loss = 1e6
-        patience=10
-        waited = 0
+        if early_stopping:
+            valid_loss = 1e6
+            patience = 5
+            waited = 0
+        profile_started = False
+        if profile:
+            try:
+                jax.profiler.start_trace("/scratch/jr7348/tmp_jax-trace")
+                profile_started = True
+                logger.info("JAX profiler started - will trace first 100 iterations")
+            except RuntimeError as e:
+                logger.warning(f"Could not start JAX profiler: {e}")
         for it in pbar:
             rng_jax, rng_step_fn = jax.random.split(rng_jax, 2)
             batch = sampler.sample(rng_np)
             loss = self.solver.step_fn(rng_step_fn, batch)
             self.training_logs["loss"].append(float(loss))
+
+            # Stop profiler after 100 iterations (outside validation block)
+            if profile_started and it == 100:
+                jax.profiler.stop_trace()
+                profile_started = False
+                logger.info(
+                    "JAX profiler stopped - trace saved to /scratch/jr7348/tmp_jax-trace"
+                )
+
             if ((it - 1) % valid_freq == 0) and (it > 1):
                 # Get predictions from validation data
                 validate = False
@@ -174,16 +195,17 @@ class CellFlowTrainer:
 
                 if validate:
                     self._update_logs(metrics)
-                if metrics["test_sinkhorn_div_mean"] < valid_loss:
-                    valid_loss = metrics["test_sinkhorn_div_mean"]
-                    waited = 0
-                else:
-                    waited += 1
-                if waited >= patience:
-                    print(f"Early stopping at iteration {it}")
-                    jax.clear_caches()
-                    gc.collect()
-                    break
+                    if early_stopping:
+                        if metrics["train_sinkhorn_div_mean"] < valid_loss:
+                            valid_loss = metrics["train_sinkhorn_div_mean"]
+                            waited = 0
+                        else:
+                            waited += 1
+                        if waited >= patience:
+                            print(f"Early stopping at iteration {it}")
+                            jax.clear_caches()
+                            gc.collect()
+                            break
 
                     # Update progress bar
                     mean_loss = np.mean(self.training_logs["loss"][-valid_freq:])
@@ -195,6 +217,13 @@ class CellFlowTrainer:
                     pbar.set_postfix(postfix_dict)
                 jax.clear_caches()
                 gc.collect()
+
+        # Stop profiler if still running (e.g., early stopping before 100 iterations)
+        if profile_started:
+            jax.profiler.stop_trace()
+            logger.info(
+                "JAX profiler stopped - trace saved to /scratch/jr7348/tmp_jax-trace"
+            )
 
         if num_iterations > 0:
             valid_source_data, valid_true_data, valid_pred_data = self._validation_step(

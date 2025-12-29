@@ -552,6 +552,10 @@ class CellFlow:
         callbacks: Sequence[BaseCallback] = [],
         monitor_metrics: Sequence[str] = [],
         out_of_core_dataloading: bool = False,
+        dataloading_seed: int = 42,
+        n_conditions_per_batch: int = 1,
+        profile=False,
+        epoch_length: int | None = None,
     ) -> None:
         """Train the model.
 
@@ -612,6 +616,8 @@ class CellFlow:
             valid_loaders=validation_loaders,
             callbacks=callbacks,
             monitor_metrics=monitor_metrics,
+            profile=profile,
+            epoch_length=epoch_length,
         )
 
     def predict(
