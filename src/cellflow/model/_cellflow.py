@@ -248,9 +248,13 @@ class CellFlow:
         self,
         condition_mode: Literal["deterministic", "stochastic"] = "deterministic",
         regularization: float = 0.0,
-        pooling: Literal["mean", "attention_token", "attention_seed"] = "attention_token",
+        pooling: Literal[
+            "mean", "attention_token", "attention_seed"
+        ] = "attention_token",
         pooling_kwargs: dict[str, Any] = types.MappingProxyType({}),
-        layers_before_pool: Layers_separate_input_t | Layers_t = dc_field(default_factory=lambda: []),
+        layers_before_pool: Layers_separate_input_t | Layers_t = dc_field(
+            default_factory=lambda: []
+        ),
         layers_after_pool: Layers_t = dc_field(default_factory=lambda: []),
         condition_embedding_dim: int = 256,
         cond_output_dropout: float = 0.9,
@@ -268,9 +272,13 @@ class CellFlow:
         decoder_dropout: float = 0.0,
         vf_act_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.silu,
         vf_kwargs: dict[str, Any] | None = None,
-        probability_path: dict[Literal["constant_noise", "bridge"], float] | None = None,
-        match_fn: Callable[[ArrayLike, ArrayLike], ArrayLike] = match_linear,
-        optimizer: optax.GradientTransformation = optax.MultiSteps(optax.adam(5e-5), 20),
+        probability_path: (
+            dict[Literal["constant_noise", "bridge"], float] | None
+        ) = None,
+        match_fn: Callable[[ArrayLike, ArrayLike], ArrayLike] = labeled_match_linear,
+        optimizer: optax.GradientTransformation = optax.MultiSteps(
+            optax.adam(5e-5), 20
+        ),
         solver_kwargs: dict[str, Any] | None = None,
         layer_norm_before_concatenation: bool = False,
         linear_projection_before_concatenation: bool = False,
@@ -424,25 +432,34 @@ class CellFlow:
           :class:`cellflow.training.CellFlowTrainer`.
         """
         if self.train_data is None:
-            raise ValueError("Dataloader not initialized. Please call `prepare_data` first.")
+            raise ValueError(
+                "Dataloader not initialized. Please call `prepare_data` first."
+            )
 
         if condition_mode == "stochastic":
             if regularization == 0.0:
-                raise ValueError("Stochastic condition embeddings require `regularization`>0.")
+                raise ValueError(
+                    "Stochastic condition embeddings require `regularization`>0."
+                )
 
         condition_encoder_kwargs = condition_encoder_kwargs or {}
         if self._solver_class == _otfm.OTFlowMatching and vf_kwargs is not None:
             raise ValueError("For `solver='otfm'`, `vf_kwargs` must be `None`.")
         if self._solver_class == _genot.GENOT:
             if vf_kwargs is None:
-                vf_kwargs = {"genot_source_dims": [1024, 1024, 1024], "genot_source_dropout": 0.0}
+                vf_kwargs = {
+                    "genot_source_dims": [1024, 1024, 1024],
+                    "genot_source_dropout": 0.0,
+                }
             else:
                 assert isinstance(vf_kwargs, dict)
                 assert "genot_source_dims" in vf_kwargs
                 assert "genot_source_dropout" in vf_kwargs
         else:
             vf_kwargs = {}
-        covariates_not_pooled = [] if pool_sample_covariates else self._dm.sample_covariates
+        covariates_not_pooled = (
+            [] if pool_sample_covariates else self._dm.sample_covariates
+        )
         solver_kwargs = solver_kwargs or {}
         probability_path = probability_path or {"constant_noise": 0.0}
 
@@ -508,7 +525,9 @@ class CellFlow:
                 **solver_kwargs,
             )
         else:
-            raise NotImplementedError(f"Solver must be an instance of OTFlowMatching or GENOT, got {type(self.solver)}")
+            raise NotImplementedError(
+                f"Solver must be an instance of OTFlowMatching or GENOT, got {type(self.solver)}"
+            )
 
         self._trainer = CellFlowTrainer(solver=self.solver, predict_kwargs=self.validation_data["predict_kwargs"], model=self)  # type: ignore[arg-type]
 
@@ -559,7 +578,9 @@ class CellFlow:
             raise ValueError("Data not initialized. Please call `prepare_data` first.")
 
         if self.trainer is None:
-            raise ValueError("Model not initialized. Please call `prepare_model` first.")
+            raise ValueError(
+                "Model not initialized. Please call `prepare_model` first."
+            )
 
         if out_of_core_dataloading:
             self._dataloader = OOCTrainSampler(data=self.train_data, batch_size=batch_size)
@@ -715,7 +736,9 @@ class CellFlow:
                 condition_id_key=condition_id_key,
             )
         else:
-            raise ValueError("Covariate data must be a `pandas.DataFrame` or an instance of `BaseData`.")
+            raise ValueError(
+                "Covariate data must be a `pandas.DataFrame` or an instance of `BaseData`."
+            )
 
         condition_embeddings_mean: dict[str, ArrayLike] = {}
         condition_embeddings_var: dict[str, ArrayLike] = {}
@@ -727,12 +750,16 @@ class CellFlow:
             else:
                 cov_combination = cond_data.perturbation_idx_to_covariates[i]
                 c_key = tuple(cov_combination[i] for i in range(len(cov_combination)))
-            condition_embeddings_mean[c_key], condition_embeddings_var[c_key] = self.solver.get_condition_embedding(
-                condition
+            condition_embeddings_mean[c_key], condition_embeddings_var[c_key] = (
+                self.solver.get_condition_embedding(condition)
             )
 
-        df_mean = pd.DataFrame.from_dict({k: v[0] for k, v in condition_embeddings_mean.items()}).T
-        df_var = pd.DataFrame.from_dict({k: v[0] for k, v in condition_embeddings_var.items()}).T
+        df_mean = pd.DataFrame.from_dict(
+            {k: v[0] for k, v in condition_embeddings_mean.items()}
+        ).T
+        df_var = pd.DataFrame.from_dict(
+            {k: v[0] for k, v in condition_embeddings_var.items()}
+        ).T
 
         if condition_id_key:
             df_mean.index.set_names([condition_id_key], inplace=True)
@@ -814,13 +841,19 @@ class CellFlow:
         Loaded instance of the model.
         """
         # Check if filename is a directory
-        file_name = os.path.join(filename, f"{cls.__name__}.pkl") if os.path.isdir(filename) else filename
+        file_name = (
+            os.path.join(filename, f"{cls.__name__}.pkl")
+            if os.path.isdir(filename)
+            else filename
+        )
 
         with open(file_name, "rb") as f:
             model = cloudpickle.load(f)
 
         if type(model) is not cls:
-            raise TypeError(f"Expected the model to be type of `{cls}`, found `{type(model)}`.")
+            raise TypeError(
+                f"Expected the model to be type of `{cls}`, found `{type(model)}`."
+            )
         return model
 
     @property
@@ -856,7 +889,11 @@ class CellFlow:
     @property
     def velocity_field(
         self,
-    ) -> _velocity_field.ConditionalVelocityField | _velocity_field.GENOTConditionalVelocityField | None:
+    ) -> (
+        _velocity_field.ConditionalVelocityField
+        | _velocity_field.GENOTConditionalVelocityField
+        | None
+    ):
         """The conditional velocity field."""
         return self._vf
 
@@ -869,14 +906,18 @@ class CellFlow:
     def train_data(self, data: TrainingData) -> None:
         """Set the training data."""
         if not isinstance(data, TrainingData):
-            raise ValueError(f"Expected `data` to be an instance of `TrainingData`, found `{type(data)}`.")
+            raise ValueError(
+                f"Expected `data` to be an instance of `TrainingData`, found `{type(data)}`."
+            )
         self._train_data = data
 
     @velocity_field.setter  # type: ignore[attr-defined,no-redef]
     def velocity_field(self, vf: _velocity_field.ConditionalVelocityField) -> None:
         """Set the velocity field."""
         if not isinstance(vf, _velocity_field.ConditionalVelocityField):
-            raise ValueError(f"Expected `vf` to be an instance of `ConditionalVelocityField`, found `{type(vf)}`.")
+            raise ValueError(
+                f"Expected `vf` to be an instance of `ConditionalVelocityField`, found `{type(vf)}`."
+            )
         self._vf = vf
 
     @property
