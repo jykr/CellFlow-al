@@ -25,6 +25,7 @@ __all__ = [
     "BaseCallback",
     "LoggingCallback",
     "ComputationCallback",
+    "CheckpointCallback",
     "Metrics",
     "WandbLogger",
     "CallbackRunner",
