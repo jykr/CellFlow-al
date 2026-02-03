@@ -78,10 +78,9 @@ class CellFlowTrainer:
             true_tgt = batch["target"]
             valid_source_data[val_key] = src
             valid_pred_data[val_key] = self.solver.predict(
-                src, condition=condition, **self.predict_kwargs
+                src, condition=condition, batched=True, **self.predict_kwargs
             )
             valid_true_data[val_key] = true_tgt
-
         return valid_source_data, valid_true_data, valid_pred_data
 
     def _update_logs(self, logs: dict[str, Any]) -> None:
@@ -100,7 +99,7 @@ class CellFlowTrainer:
         monitor_metrics: Sequence[str] = [],
         callbacks: Sequence[BaseCallback] = [],
         profile=False,
-        early_stopping=True,
+        early_stopping=False,
         epoch_length: int | None = None,
     ) -> _otfm.OTFlowMatching | _genot.GENOT:
         """Trains the model.
@@ -139,7 +138,7 @@ class CellFlowTrainer:
             )
         else:
             train_conditions = dataloader.data_manager.perturbation_covariates
-        crun.on_train_begin(train_conditions=train_conditions)
+        crun.on_train_begin(train_conditions=train_conditions, model=self.model)
 
         pbar = tqdm(range(num_iterations))
         sampler = dataloader
@@ -150,29 +149,23 @@ class CellFlowTrainer:
             patience = 5
             waited = 0
         profile_started = False
-        if profile:
-            try:
-                jax.profiler.start_trace("/scratch/jr7348/tmp_jax-trace")
-                profile_started = True
-                logger.info("JAX profiler started - will trace first 100 iterations")
-            except RuntimeError as e:
-                logger.warning(f"Could not start JAX profiler: {e}")
         for it in pbar:
             rng_jax, rng_step_fn = jax.random.split(rng_jax, 2)
             batch = sampler.sample(rng_np)
             loss = self.solver.step_fn(rng_step_fn, batch)
             self.training_logs["loss"].append(float(loss))
 
-            # Stop profiler after 100 iterations (outside validation block)
-            if profile_started and it == 100:
-                jax.profiler.stop_trace()
-                profile_started = False
-                logger.info(
-                    "JAX profiler stopped - trace saved to /scratch/jr7348/tmp_jax-trace"
-                )
-
             if ((it - 1) % valid_freq == 0) and (it > 1):
                 # Get predictions from validation data
+                if profile and (it - 1) // valid_freq != 1:
+                    try:
+                        jax.profiler.start_trace("/scratch/jr7348/tmp_jax-trace")
+                        profile_started = True
+                        logger.info(
+                            "JAX profiler started - will trace first 100 iterations"
+                        )
+                    except RuntimeError as e:
+                        logger.warning(f"Could not start JAX profiler: {e}")
                 validate = False
                 if any(
                     [
@@ -191,7 +184,7 @@ class CellFlowTrainer:
                 if epoch_length is None:
                     epoch_length = valid_freq
 
-                metrics = crun.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, self.solver, model=self.model, epoch_id=it // epoch_length)  # type: ignore[arg-type]
+                metrics = crun.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, self.solver, state=self.solver.vf_state_inference, epoch_id=it // epoch_length)  # type: ignore[arg-type]
 
                 if validate:
                     self._update_logs(metrics)
@@ -215,8 +208,13 @@ class CellFlowTrainer:
                     }
                     postfix_dict["loss"] = round(mean_loss, 3)
                     pbar.set_postfix(postfix_dict)
-                jax.clear_caches()
-                gc.collect()
+            # Stop profiler after 100 iterations (outside validation block)
+            if profile_started:
+                jax.profiler.stop_trace()
+                profile_started = False
+                logger.info(
+                    "JAX profiler stopped - trace saved to /scratch/jr7348/tmp_jax-trace"
+                )
 
         # Stop profiler if still running (e.g., early stopping before 100 iterations)
         if profile_started:
@@ -237,6 +235,13 @@ class CellFlowTrainer:
                 model=self.model,
             )
             self._update_logs(metrics)
+            self._update_logs(
+                {
+                    "source_data": valid_source_data,
+                    "pred_data": valid_pred_data,
+                    "true_data": valid_true_data,
+                }
+            )
 
         self.solver.is_trained = True
         return self.solver

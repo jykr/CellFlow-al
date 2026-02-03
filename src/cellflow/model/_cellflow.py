@@ -1,4 +1,5 @@
 import functools
+from logging import warning
 import os
 import types
 from collections.abc import Callable, Sequence
@@ -28,7 +29,7 @@ from cellflow.data._datamanager import DataManager
 from cellflow.model._utils import _write_predictions
 from cellflow.networks import _velocity_field
 from cellflow.plotting import _utils
-from cellflow.solvers import _genot, _otfm
+from cellflow.solvers import _genot, _otfm, _conical
 from cellflow.training._callbacks import BaseCallback
 from cellflow.training._trainer import CellFlowTrainer
 from cellflow.utils import match_linear, labeled_match_linear
@@ -53,7 +54,10 @@ class CellFlow:
 
     def __init__(self, adata: ad.AnnData, solver: Literal["otfm", "genot"] = "otfm"):
         self._adata = adata
-        self._solver_class = _otfm.OTFlowMatching if solver == "otfm" else _genot.GENOT
+        self._solver_class = {
+            "otfm": _otfm.OTFlowMatching,
+            "genot": _genot.GENOT,
+        }[solver]
         self._vf_class = (
             _velocity_field.ConditionalVelocityField
             if solver == "otfm"
@@ -287,7 +291,7 @@ class CellFlow:
         vf_act_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.silu,
         vf_kwargs: dict[str, Any] | None = None,
         probability_path: (
-            dict[Literal["constant_noise", "bridge"], float] | None
+            dict[Literal["constant_noise", "bridge", "conical"], float] | None
         ) = None,
         match_fn: Callable[[ArrayLike, ArrayLike], ArrayLike] = labeled_match_linear,
         optimizer: optax.GradientTransformation = optax.MultiSteps(
@@ -506,18 +510,24 @@ class CellFlow:
             linear_projection_before_concatenation=linear_projection_before_concatenation,
             **vf_kwargs,
         )
+        if sample_multiple_conditions_per_batch:
+            match_fn = labeled_match_linear
+        if probability_path == "conical":
+            match_fn = None
 
         probability_path, noise = next(iter(probability_path.items()))
         if probability_path == "constant_noise":
             probability_path = dynamics.ConstantNoiseFlow(noise)
         elif probability_path == "bridge":
             probability_path = dynamics.BrownianBridge(noise)
+        elif probability_path == "conical":
+            probability_path = _conical.GaussianConicalFlow()
+            warning("`conical` probability path doesn't use noise and is ignored.")
         else:
             raise NotImplementedError(
                 f"The key of `probability_path` must be `'constant_noise'` or `'bridge'` but found {probability_path}."
             )
-        if sample_multiple_conditions_per_batch:
-            match_fn = labeled_match_linear
+
         if self._solver_class == _otfm.OTFlowMatching:
             self._solver = self._solver_class(
                 vf=self.vf,
@@ -616,7 +626,11 @@ class CellFlow:
                 n_conditions_per_batch=n_conditions_per_batch,
             )
         validation_loaders = {
-            k: ValidationSampler(v, batch_size=batch_size // 2, seed=dataloading_seed)
+            k: ValidationSampler(
+                v,
+                batch_size=(batch_size // 2 if k == "train" else batch_size),
+                seed=dataloading_seed,
+            )
             for k, v in self.validation_data.items()
             if k != "predict_kwargs"
         }

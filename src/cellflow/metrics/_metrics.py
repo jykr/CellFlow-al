@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import functools
 import gc
 import jax
 import numpy as np
@@ -39,7 +40,9 @@ def compute_r_squared(x: ArrayLike, y: ArrayLike) -> float:
     return r2_score(np.mean(x, axis=0), np.mean(y, axis=0))
 
 
-def compute_sinkhorn_div(x: ArrayLike, y: ArrayLike, epsilon: float = None) -> float:
+def compute_sinkhorn_div(
+    x: ArrayLike, y: ArrayLike, epsilon: float | None = None
+) -> float:
     """Compute the Sinkhorn divergence between x and y as in :cite:`feydy:19`.
 
     Parameters
@@ -55,16 +58,17 @@ def compute_sinkhorn_div(x: ArrayLike, y: ArrayLike, epsilon: float = None) -> f
     -------
         A scalar denoting the sinkhorn divergence value.
     """
+    # Ensure inputs are JAX arrays on the correct device
+    x = jnp.asarray(x)
+    y = jnp.asarray(y)
     res = sinkhorn_divergence(
         pointcloud.PointCloud,
         x=x,
         y=y,
         cost_fn=costs.SqEuclidean(),
+        relative_epsilon="std",
         epsilon=epsilon,
-        scale_cost=1.0,
     )[0]
-    jax.clear_caches()
-    gc.collect()
     return res
 
 
@@ -124,7 +128,6 @@ def pairwise_squeuclidean(
         return ((x[:, None, :] - y[None, :, :]) ** 2).sum(-1)
 
 
-@jax.jit
 def compute_e_distance_fast(x: ArrayLike, y: ArrayLike) -> float:
     """Compute the energy distance between x and y as in :cite:`Peidli2024`.
 
@@ -203,7 +206,6 @@ def compute_mean_metrics(
     return metric_dict
 
 
-@jax.jit
 def rbf_kernel_fast(x: ArrayLike, y: ArrayLike, gamma: float) -> ArrayLike:
     xx = (x**2).sum(1)
     yy = (y**2).sum(1)

@@ -2,7 +2,7 @@ import abc
 import queue
 import threading
 from collections.abc import Generator
-from typing import Any, Literal
+from typing import Any, Literal, Dict
 from loguru import logger
 import jax
 import numpy as np
@@ -223,7 +223,10 @@ class ValidationSampler(BaseValidSampler):
     """
 
     def __init__(
-        self, val_data: ValidationData, batch_size: int = 1024, seed: int = 0
+        self,
+        val_data: ValidationData,
+        batch_size: int = 1024,
+        seed: int = 0,
     ) -> None:
         self._data = val_data
         self.batch_size = batch_size
@@ -247,14 +250,16 @@ class ValidationSampler(BaseValidSampler):
     ) -> np.ndarray:
         """Sample batch_size indices from a set of valid indices."""
         if len(indices) <= self.batch_size:
-            return indices
+            return rng.choice(
+                indices, size=self.batch_size, replace=True
+            )  # keep data shape for jax
         return rng.choice(indices, size=self.batch_size, replace=False)
 
     def sample(
         self,
         mode: Literal["on_log_iteration", "on_train_end"],
         rng: np.random.Generator,
-    ) -> Any:
+    ) -> Dict[str, dict[str, np.ndarray]]:
         """Sample data for validation.
 
         Parameters
@@ -415,8 +420,8 @@ class OOCTrainSampler:
         seed: int,
         batch_size: int = 1024,
         n_conditions_per_batch: int = 1,
-        num_workers: int = 10,
-        prefetch_factor: int = 10,
+        num_workers: int = 2,
+        prefetch_factor: int = 4,
     ):
         self.inner = TrainSampler(
             data=data,

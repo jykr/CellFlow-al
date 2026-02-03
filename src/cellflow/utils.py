@@ -72,7 +72,7 @@ def labeled_match_linear(
     source_labels: jnp.ndarray,
     target_labels: jnp.ndarray,
     cost_fn: costs.CostFn | None = costs.SqEuclidean(),
-    epsilon: float | None = None,
+    epsilon: float | None = 0.1,
     scale_cost: ScaleCost_t = "mean",
     tau_a: float = 1.0,
     tau_b: float = 1.0,
@@ -146,6 +146,7 @@ def labeled_match_linear(
     masked_geom = geometry.Geometry(
         cost_matrix=masked_cost,
         epsilon=epsilon,
+        relative_epsilon="std",
     )
 
     problem = linear_problem.LinearProblem(masked_geom, tau_a=tau_a, tau_b=tau_b)

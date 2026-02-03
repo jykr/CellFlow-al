@@ -237,12 +237,14 @@ class OTFlowMatching:
         **kwargs: Any,
     ) -> ArrayLike:
         """See :meth:`OTFlowMatching.predict`."""
-        # kwargs.setdefault("dt0", None)
-        # kwargs.setdefault("solver", diffrax.Tsit5())
-        # kwargs.setdefault("stepsize_controller", diffrax.PIDController(rtol=1e-5, atol=1e-5))
-        kwargs.setdefault("dt0", 0.01)  # Fixed step size: 100 steps total
-        kwargs.setdefault("solver", diffrax.Euler())
-        kwargs.setdefault("stepsize_controller", diffrax.ConstantStepSize())
+        kwargs.setdefault("dt0", None)
+        kwargs.setdefault("solver", diffrax.Tsit5())
+        kwargs.setdefault(
+            "stepsize_controller", diffrax.PIDController(rtol=1e-5, atol=1e-5)
+        )
+        # kwargs.setdefault("dt0", 0.01)  # Fixed step size: 100 steps total
+        # kwargs.setdefault("solver", diffrax.Euler())
+        # kwargs.setdefault("stepsize_controller", diffrax.ConstantStepSize())
         kwargs = frozen_dict.freeze(kwargs)
 
         noise_dim = (1, self.vf.condition_embedding_dim)
@@ -279,7 +281,7 @@ class OTFlowMatching:
             )
             return result.ys[0]
 
-        x_pred = jax.jit(jax.vmap(solve_ode, in_axes=[0, None, None]))(
+        x_pred = jax.vmap(solve_ode, in_axes=[0, None, None])(
             x, condition, encoder_noise
         )
         return x_pred
@@ -327,18 +329,15 @@ class OTFlowMatching:
         if batched:
             keys = sorted(x.keys())
             condition_keys = sorted(set().union(*(condition[k].keys() for k in keys)))
-            _predict_jit = jax.jit(
-                lambda x, condition: self._predict_jit(x, condition, rng, **kwargs)
-            )
-            batched_predict = jax.vmap(
-                _predict_jit, in_axes=(0, dict.fromkeys(condition_keys, 0))
-            )
+
             # assert that the number of cells is the same for each condition
             n_cells = x[keys[0]].shape[0]
             for k in keys:
                 assert (
                     x[k].shape[0] == n_cells
                 ), "The number of cells must be the same for each condition"
+
+            # Stack inputs and conditions
             src_inputs = jnp.stack([x[k] for k in keys], axis=0)
             batched_conditions = {}
             for cond_key in condition_keys:
@@ -346,7 +345,61 @@ class OTFlowMatching:
                     [condition[k][cond_key] for k in keys]
                 )
 
-            pred_targets = batched_predict(src_inputs, batched_conditions)
+            # Setup ODE solver kwargs
+            kwargs.setdefault("dt0", None)
+            kwargs.setdefault("solver", diffrax.Tsit5())
+            kwargs.setdefault(
+                "stepsize_controller", diffrax.PIDController(rtol=1e-5, atol=1e-5)
+            )
+            kwargs = frozen_dict.freeze(kwargs)
+
+            noise_dim = (1, self.vf.condition_embedding_dim)
+            use_mean = rng is None or self.condition_encoder_mode == "deterministic"
+            rng = utils.default_prng_key(rng)
+            encoder_noise = (
+                jnp.zeros(noise_dim) if use_mean else jax.random.normal(rng, noise_dim)
+            )
+
+            # Get params once outside the jitted function
+            # Ensure params are on the default device (GPU if available)
+            params = jax.device_put(self.vf_state_inference.params)
+            apply_fn = self.vf_state_inference.apply_fn
+
+            # Ensure inputs are on GPU
+            src_inputs = jax.device_put(src_inputs)
+            batched_conditions = jax.device_put(batched_conditions)
+            encoder_noise = jax.device_put(encoder_noise)
+
+            def vf(t, x, args):
+                cond, enc_noise = args
+                return apply_fn({"params": params}, t, x, cond, enc_noise, train=False)[
+                    0
+                ]
+
+            def solve_single_cell(x_cell, cond, enc_noise):
+                ode_term = diffrax.ODETerm(vf)
+                result = diffrax.diffeqsolve(
+                    ode_term,
+                    t0=0.0,
+                    t1=1.0,
+                    y0=x_cell,
+                    args=(cond, enc_noise),
+                    **kwargs,
+                )
+                return result.ys[0]
+
+            def solve_condition(x_batch, cond):
+                # vmap over cells within a condition
+                return jax.vmap(solve_single_cell, in_axes=(0, None, None))(
+                    x_batch, cond, encoder_noise
+                )
+
+            # vmap over conditions, then jit the whole thing
+            batched_solve = jax.vmap(
+                solve_condition, in_axes=(0, dict.fromkeys(condition_keys, 0))
+            )
+
+            pred_targets = batched_solve(src_inputs, batched_conditions)
             return {k: pred_targets[i] for i, k in enumerate(keys)}
         elif isinstance(x, dict):
             return jax.tree.map(

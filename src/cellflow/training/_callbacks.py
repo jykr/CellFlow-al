@@ -1,5 +1,6 @@
 import abc
 from collections.abc import Callable, Sequence
+from functools import partial
 import json
 import os
 import jax
@@ -11,7 +12,7 @@ import anndata as ad
 import jax.tree as jt
 import jax.tree_util as jtu
 import numpy as np
-
+import orbax.checkpoint as ocp
 from cellflow._types import ArrayLike
 from cellflow.metrics._metrics import (
     compute_e_distance_fast,
@@ -38,6 +39,13 @@ metric_to_func: dict[str, Callable[[ArrayLike, ArrayLike], float | ArrayLike]] =
     "r_squared": compute_r_squared,
     "mmd": compute_scalar_mmd,
     "sinkhorn_div": compute_sinkhorn_div,
+    "e_distance": compute_e_distance_fast,
+}
+
+val_metric_to_func: dict[str, Callable[[ArrayLike, ArrayLike], float | ArrayLike]] = {
+    "r_squared": compute_r_squared,
+    "mmd": compute_scalar_mmd,
+    "sinkhorn_div": partial(compute_sinkhorn_div, epsilon=0.1),
     "e_distance": compute_e_distance_fast,
 }
 
@@ -180,9 +188,16 @@ class Metrics(ComputationCallback):
     def __init__(
         self,
         metrics: list[Literal["r_squared", "mmd", "sinkhorn_div", "e_distance"]],
+        log_metrics: list[
+            Literal["r_squared", "mmd", "sinkhorn_div", "e_distance"]
+        ] = None,
         metric_aggregations: list[Literal["mean", "median"]] = None,
     ):
         self.metrics = metrics
+        if log_metrics is not None:
+            self.log_metrics = log_metrics
+        else:
+            self.log_metrics = metrics
         self.metric_aggregation = (
             ["mean"] if metric_aggregations is None else metric_aggregations
         )
@@ -203,6 +218,7 @@ class Metrics(ComputationCallback):
         valid_true_data: dict[str, dict[str, ArrayLike]],
         valid_pred_data: dict[str, dict[str, ArrayLike]],
         solver: _otfm.OTFlowMatching | _genot.GENOT,
+        log_metrics=None,
     ) -> dict[str, float]:
         """Called at each validation/log iteration to compute metrics
 
@@ -223,7 +239,9 @@ class Metrics(ComputationCallback):
             Computed metrics between the true validation data and predicted validation data as a dictionary
         """
         metrics = {}
-        for metric in self.metrics:
+        if log_metrics is None:
+            log_metrics = self.log_metrics
+        for metric in log_metrics:
             for k in valid_true_data.keys():
                 # Check if we can batch (all arrays same shape)
                 keys = list(valid_true_data[k].keys())
@@ -241,10 +259,18 @@ class Metrics(ComputationCallback):
                     and metric in ["e_distance", "sinkhorn_div"]
                 ):
                     # Stack and use vmap for parallel computation
-                    true_stacked = jnp.stack(true_arrays, axis=0)
-                    pred_stacked = jnp.stack(pred_arrays, axis=0)
-                    batched_fn = jax.vmap(metric_to_func[metric])
+                    # Ensure arrays are JAX arrays on the correct device
+                    true_stacked = jnp.stack(
+                        [jnp.asarray(t) for t in true_arrays], axis=0
+                    )
+                    pred_stacked = jnp.stack(
+                        [jnp.asarray(p) for p in pred_arrays], axis=0
+                    )
+                    # JIT + vmap for GPU utilization
+                    batched_fn = jax.vmap(val_metric_to_func[metric])
                     results = batched_fn(true_stacked, pred_stacked)
+                    # Block until computation completes before extracting
+                    results = jax.block_until_ready(results)
                     out = {key: float(results[i]) for i, key in enumerate(keys)}
                 else:
                     # Fall back to sequential
@@ -287,7 +313,11 @@ class Metrics(ComputationCallback):
             Computed metrics between the true validation data and predicted validation data as a dictionary
         """
         return self.on_log_iteration(
-            valid_source_data, valid_true_data, valid_pred_data, solver
+            valid_source_data,
+            valid_true_data,
+            valid_pred_data,
+            solver,
+            log_metrics=self.metrics,
         )
 
 
@@ -532,21 +562,25 @@ class WandbLogger(LoggingCallback):
 class CheckpointCallback(BaseCallback):
     def __init__(self, checkpoint_dir: str):
         self.checkpoint_dir = checkpoint_dir.rstrip("/")
+        self.checkpoint_manager = ocp.CheckpointManager(
+            self.checkpoint_dir,
+            options=ocp.CheckpointManagerOptions(max_to_keep=100, create=True),
+        )
 
-    def on_train_begin(self, train_conditions):
+    def on_train_begin(self, train_conditions, model):
         log_path = f"{self.checkpoint_dir}-train_conditions.json"
         with open(log_path, "w") as f:
             json.dump(train_conditions, f)
+        os.makedirs(self.checkpoint_dir + "_0", exist_ok=True)
+        model.save(self.checkpoint_dir + "_0", overwrite=True)
 
-    def on_log_iteration(self, model, epoch_id: int | None = None):
-        out_dir = f"{self.checkpoint_dir}-epoch{epoch_id}"
-        os.makedirs(out_dir, exist_ok=True)
-        model.save(out_dir, overwrite=True)
+    def on_log_iteration(self, state, epoch_id: int | None = None):
+        self.checkpoint_manager.save(epoch_id, args=ocp.args.StandardSave(state))
+        self._last_epoch = epoch_id
 
     def on_train_end(self, model):
-        out_dir = f"{self.checkpoint_dir}-final"
-        os.makedirs(out_dir, exist_ok=True)
-        model.save(out_dir, overwrite=True)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        model.save(self.checkpoint_dir, overwrite=True)
 
 
 class CallbackRunner:
@@ -583,7 +617,7 @@ class CallbackRunner:
         #         "No computation callbacks defined to compute metrics to log"
         #     )
 
-    def on_train_begin(self, train_conditions: List[Any] = None) -> Any:
+    def on_train_begin(self, train_conditions: List[Any] = None, model=None) -> Any:
         """Called at the beginning of training to initiate callbacks"""
         for callback in self.computation_callbacks:
             callback.on_train_begin()
@@ -596,7 +630,7 @@ class CallbackRunner:
                 raise ValueError(
                     "train_conditions must be provided for checkpoint callbacks."
                 )
-            callback.on_train_begin(train_conditions)
+            callback.on_train_begin(train_conditions, model)
 
     def on_log_iteration(
         self,
@@ -604,7 +638,7 @@ class CallbackRunner:
         valid_data: dict[str, dict[str, ArrayLike]],
         pred_data: dict[str, dict[str, ArrayLike]],
         solver: _otfm.OTFlowMatching | _genot.GENOT,
-        model=None,
+        state=None,
         epoch_id: int | None = None,
     ) -> dict[str, Any]:
         """Called at each validation/log iteration to run callbacks. First computes metrics with computation callbacks and then logs data with logging callbacks.
@@ -633,7 +667,7 @@ class CallbackRunner:
                 valid_source_data, valid_data, pred_data, solver
             )
             dict_to_log.update(results)
-            jax.clear_caches()
+            # Note: Removed jax.clear_caches() - it was causing step_fn to recompile every validation
             gc.collect()
             logger.debug(f"Done running computation callback: {callback}")
 
@@ -641,7 +675,7 @@ class CallbackRunner:
             callback.on_log_iteration(dict_to_log)  # type: ignore[call-arg]
 
         for callback in self.checkpoint_callbacks:
-            callback.on_log_iteration(model, epoch_id)
+            callback.on_log_iteration(state, epoch_id)
 
         return dict_to_log
 
