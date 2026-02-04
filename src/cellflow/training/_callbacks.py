@@ -192,6 +192,7 @@ class Metrics(ComputationCallback):
             Literal["r_squared", "mmd", "sinkhorn_div", "e_distance"]
         ] = None,
         metric_aggregations: list[Literal["mean", "median"]] = None,
+        call_loader_keys: List[str] | None = None,
     ):
         self.metrics = metrics
         if log_metrics is not None:
@@ -201,6 +202,7 @@ class Metrics(ComputationCallback):
         self.metric_aggregation = (
             ["mean"] if metric_aggregations is None else metric_aggregations
         )
+        self.call_loader_keys = call_loader_keys
         for metric in metrics:
             # TODO: support custom callables as metrics
             if metric not in metric_to_func:
@@ -243,47 +245,51 @@ class Metrics(ComputationCallback):
             log_metrics = self.log_metrics
         for metric in log_metrics:
             for k in valid_true_data.keys():
-                # Check if we can batch (all arrays same shape)
-                keys = list(valid_true_data[k].keys())
-                true_arrays = [valid_true_data[k][key] for key in keys]
-                pred_arrays = [valid_pred_data[k][key] for key in keys]
+                if self.call_loader_keys is None or k in self.call_loader_keys:
+                    logger.debug(f"Computing {metric} for validation key {k}")
+                    # Check if we can batch (all arrays same shape)
+                    keys = list(valid_true_data[k].keys())
+                    true_arrays = [valid_true_data[k][key] for key in keys]
+                    pred_arrays = [valid_pred_data[k][key] for key in keys]
 
-                # Try batched computation if shapes match
-                shapes_match = all(
-                    t.shape == true_arrays[0].shape for t in true_arrays
-                ) and all(p.shape == pred_arrays[0].shape for p in pred_arrays)
+                    # Try batched computation if shapes match
+                    shapes_match = all(
+                        t.shape == true_arrays[0].shape for t in true_arrays
+                    ) and all(p.shape == pred_arrays[0].shape for p in pred_arrays)
 
-                if (
-                    len(keys) > 0
-                    and shapes_match
-                    and metric in ["e_distance", "sinkhorn_div"]
-                ):
-                    # Stack and use vmap for parallel computation
-                    # Ensure arrays are JAX arrays on the correct device
-                    true_stacked = jnp.stack(
-                        [jnp.asarray(t) for t in true_arrays], axis=0
-                    )
-                    pred_stacked = jnp.stack(
-                        [jnp.asarray(p) for p in pred_arrays], axis=0
-                    )
-                    # JIT + vmap for GPU utilization
-                    batched_fn = jax.vmap(val_metric_to_func[metric])
-                    results = batched_fn(true_stacked, pred_stacked)
-                    # Block until computation completes before extracting
-                    results = jax.block_until_ready(results)
-                    out = {key: float(results[i]) for i, key in enumerate(keys)}
-                else:
-                    # Fall back to sequential
-                    out = jtu.tree_map(
-                        metric_to_func[metric], valid_true_data[k], valid_pred_data[k]
-                    )
-                logger.debug(f"Computed {metric} for validation key {k}: {out}")
-                out_flattened = jt.flatten(out)[0]
-                for agg_fn in self.metric_aggregation:
-                    metrics[f"{k}_{metric}_{agg_fn}"] = agg_fn_to_func[agg_fn](
-                        out_flattened
-                    )
-                metrics[f"{k}_{metric}"] = out
+                    if (
+                        len(keys) > 0
+                        and shapes_match
+                        and metric in ["e_distance", "sinkhorn_div"]
+                    ):
+                        # Stack and use vmap for parallel computation
+                        # Ensure arrays are JAX arrays on the correct device
+                        true_stacked = jnp.stack(
+                            [jnp.asarray(t) for t in true_arrays], axis=0
+                        )
+                        pred_stacked = jnp.stack(
+                            [jnp.asarray(p) for p in pred_arrays], axis=0
+                        )
+                        # JIT + vmap for GPU utilization
+                        batched_fn = jax.vmap(val_metric_to_func[metric])
+                        results = batched_fn(true_stacked, pred_stacked)
+                        # Block until computation completes before extracting
+                        results = jax.block_until_ready(results)
+                        out = {key: float(results[i]) for i, key in enumerate(keys)}
+                    else:
+                        # Fall back to sequential
+                        out = jtu.tree_map(
+                            metric_to_func[metric],
+                            valid_true_data[k],
+                            valid_pred_data[k],
+                        )
+                    logger.debug(f"Computed {metric} for validation key {k}: {out}")
+                    out_flattened = jt.flatten(out)[0]
+                    for agg_fn in self.metric_aggregation:
+                        metrics[f"{k}_{metric}_{agg_fn}"] = agg_fn_to_func[agg_fn](
+                            out_flattened
+                        )
+                    metrics[f"{k}_{metric}"] = out
 
         return metrics  # type: ignore[return-value]
 
