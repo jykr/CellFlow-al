@@ -521,8 +521,7 @@ class CellFlow:
         elif probability_path == "bridge":
             probability_path = dynamics.BrownianBridge(noise)
         elif probability_path == "conical":
-            probability_path = _conical.GaussianConicalFlow()
-            warning("`conical` probability path doesn't use noise and is ignored.")
+            probability_path = _conical.GaussianConicalFlow(noise)
         else:
             raise NotImplementedError(
                 f"The key of `probability_path` must be `'constant_noise'` or `'bridge'` but found {probability_path}."
