@@ -103,6 +103,7 @@ class OTFlowMatching:
                     rngs={"dropout": rng_dropout, "condition_encoder": rng_encoder},
                 )
                 u_t = self.probability_path.compute_ut(t, x_t, source, target)
+
                 flow_matching_loss = jnp.mean((v_t - u_t) ** 2)
                 condition_mean_regularization = 0.5 * jnp.mean(mean_cond**2)
                 condition_var_regularization = -0.5 * jnp.mean(
@@ -242,9 +243,6 @@ class OTFlowMatching:
         kwargs.setdefault(
             "stepsize_controller", diffrax.PIDController(rtol=1e-5, atol=1e-5)
         )
-        # kwargs.setdefault("dt0", 0.01)  # Fixed step size: 100 steps total
-        # kwargs.setdefault("solver", diffrax.Euler())
-        # kwargs.setdefault("stepsize_controller", diffrax.ConstantStepSize())
         kwargs = frozen_dict.freeze(kwargs)
 
         noise_dim = (1, self.vf.condition_embedding_dim)

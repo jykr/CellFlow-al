@@ -57,11 +57,12 @@ class CellFlow:
         self._solver_class = {
             "otfm": _otfm.OTFlowMatching,
             "genot": _genot.GENOT,
+            "conical": _conical.GaussianConicalSolver,
         }[solver]
         self._vf_class = (
-            _velocity_field.ConditionalVelocityField
-            if solver == "otfm"
-            else _velocity_field.GENOTConditionalVelocityField
+            _velocity_field.GENOTConditionalVelocityField
+            if solver == "genot"
+            else _velocity_field.ConditionalVelocityField
         )
         self._dataloader: TrainSampler | OOCTrainSampler | None = None
         self._trainer: CellFlowTrainer | None = None
@@ -549,6 +550,15 @@ class CellFlow:
                 rng=jax.random.PRNGKey(seed),
                 **solver_kwargs,
             )
+        elif self._solver_class == _conical.GaussianConicalSolver:
+            self._solver = self._solver_class(
+                vf=self.vf,
+                probability_path=probability_path,
+                optimizer=optimizer,
+                conditions=self.train_data.condition_data,
+                rng=jax.random.PRNGKey(seed),
+                **solver_kwargs,
+            )
         else:
             raise NotImplementedError(
                 f"Solver must be an instance of OTFlowMatching or GENOT, got {type(self.solver)}"
@@ -568,6 +578,9 @@ class CellFlow:
         n_conditions_per_batch: int = 1,
         profile=False,
         epoch_length: int | None = None,
+        early_stopping=True,
+        min_epochs=100,
+        early_stopping_patience=5,
     ) -> None:
         """Train the model.
 
@@ -643,6 +656,9 @@ class CellFlow:
             monitor_metrics=monitor_metrics,
             profile=profile,
             epoch_length=epoch_length,
+            early_stopping=early_stopping,
+            early_stopping_patience=early_stopping_patience,
+            min_epochs=min_epochs,
         )
 
     def predict(

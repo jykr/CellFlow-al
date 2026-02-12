@@ -8,7 +8,7 @@ from numpy.typing import ArrayLike
 from tqdm import tqdm
 
 from cellflow.data._dataloader import OOCTrainSampler, TrainSampler, ValidationSampler
-from cellflow.solvers import _genot, _otfm
+from cellflow.solvers import _genot, _otfm, _conical
 from cellflow.training._callbacks import (
     BaseCallback,
     CallbackRunner,
@@ -45,7 +45,10 @@ class CellFlowTrainer:
         seed: int = 0,
         model=None,
     ):
-        if not isinstance(solver, (_otfm.OTFlowMatching | _genot.GENOT)):
+        if not isinstance(
+            solver,
+            (_otfm.OTFlowMatching | _genot.GENOT | _conical.GaussianConicalSolver),
+        ):
             raise NotImplementedError(
                 f"Solver must be an instance of OTFlowMatching or GENOT, got {type(solver)}"
             )
@@ -100,7 +103,10 @@ class CellFlowTrainer:
         callbacks: Sequence[BaseCallback] = [],
         profile=False,
         early_stopping=False,
+        early_stopping_patience: int = 5,
+        min_epochs: int = 100,
         epoch_length: int | None = None,
+        early_stopping_metric: str = "valid_sinkhorn_div_mean",
     ) -> _otfm.OTFlowMatching | _genot.GENOT:
         """Trains the model.
 
@@ -118,6 +124,8 @@ class CellFlowTrainer:
                 Callback functions.
             monitor_metrics
                 Metrics to monitor.
+            early_stopping_metric
+                Metric to use for early stopping.
 
         Returns
         -------
@@ -146,7 +154,6 @@ class CellFlowTrainer:
             dataloader.set_sampler(num_iterations=num_iterations)
         if early_stopping:
             valid_loss = 1e6
-            patience = 5
             waited = 0
         profile_started = False
         for it in pbar:
@@ -183,18 +190,20 @@ class CellFlowTrainer:
                 # Run callbacks
                 if epoch_length is None:
                     epoch_length = valid_freq
-
-                metrics = crun.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, self.solver, state=self.solver.vf_state_inference, epoch_id=it // epoch_length)  # type: ignore[arg-type]
+                current_epoch = it // epoch_length
+                metrics = crun.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, self.solver, state=self.solver.vf_state_inference, epoch_id=current_epoch)  # type: ignore[arg-type]
 
                 if validate:
                     self._update_logs(metrics)
-                    if early_stopping:
-                        if metrics["train_sinkhorn_div_mean"] < valid_loss:
-                            valid_loss = metrics["train_sinkhorn_div_mean"]
+                    if early_stopping and current_epoch > min_epochs:
+                        print(metrics.keys())
+                        print(metrics)
+                        if metrics[early_stopping_metric] < valid_loss:
+                            valid_loss = metrics[early_stopping_metric]
                             waited = 0
                         else:
                             waited += 1
-                        if waited >= patience:
+                        if waited >= early_stopping_patience:
                             print(f"Early stopping at iteration {it}")
                             jax.clear_caches()
                             gc.collect()
