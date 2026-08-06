@@ -1,8 +1,11 @@
 from collections.abc import Sequence
+import copy
 import gc
 from typing import Any, Literal
 from loguru import logger
 import jax
+import jax.numpy as jnp
+import jax.tree_util as jtu
 import numpy as np
 from numpy.typing import ArrayLike
 from tqdm import tqdm
@@ -14,6 +17,51 @@ from cellflow.training._callbacks import (
     CallbackRunner,
     ComputationCallback,
 )
+
+
+def _find_hyperparams_state(opt_state, parent=None):
+    """Walk a (possibly nested) optax opt_state and return the first state that
+    exposes a mutable ``hyperparams`` dict (i.e. was produced by
+    :func:`optax.inject_hyperparams`). Returns ``(state, parent_path)`` where
+    ``parent_path`` is the list of attribute chain to reach it from the root,
+    or ``(None, None)`` if not found.
+    """
+    if hasattr(opt_state, "hyperparams") and isinstance(
+        getattr(opt_state, "hyperparams"), dict
+    ):
+        return opt_state, parent or []
+    # optax.MultiSteps wraps an inner state in .inner_opt_state
+    if hasattr(opt_state, "inner_opt_state"):
+        found, path = _find_hyperparams_state(
+            opt_state.inner_opt_state, (parent or []) + ["inner_opt_state"]
+        )
+        if found is not None:
+            return found, path
+    # optax.chain produces a tuple of sub-states
+    if isinstance(opt_state, tuple):
+        for idx, sub in enumerate(opt_state):
+            found, path = _find_hyperparams_state(sub, (parent or []) + [idx])
+            if found is not None:
+                return found, path
+    return None, None
+
+
+def _replace_hyperparams_state(opt_state, path, new_hp_state):
+    """Return a copy of ``opt_state`` with the state at ``path`` replaced by
+    ``new_hp_state``. Mirrors :func:`_find_hyperparams_state`'s path format.
+    """
+    if not path:
+        return new_hp_state
+    head, rest = path[0], path[1:]
+    if isinstance(head, int):
+        return tuple(
+            _replace_hyperparams_state(sub, rest, new_hp_state) if i == head else sub
+            for i, sub in enumerate(opt_state)
+        )
+    # attribute replacement (e.g. inner_opt_state on MultiSteps)
+    inner = getattr(opt_state, head)
+    new_inner = _replace_hyperparams_state(inner, rest, new_hp_state)
+    return opt_state._replace(**{head: new_inner})
 
 
 class CellFlowTrainer:
@@ -107,6 +155,11 @@ class CellFlowTrainer:
         min_epochs: int = 100,
         epoch_length: int | None = None,
         early_stopping_metric: str = "valid_sinkhorn_div_mean",
+        lr_patience: int | None = None,
+        lr_factor: float = 0.5,
+        min_lr: float = 1e-6,
+        resume_state: dict[str, Any] | None = None,
+        initial_epoch_offset: int = 0,
     ) -> _otfm.OTFlowMatching | _genot.GENOT:
         """Trains the model.
 
@@ -131,7 +184,10 @@ class CellFlowTrainer:
         -------
             The trained model.
         """
-        self.training_logs = {"loss": []}
+        if resume_state is not None:
+            self.training_logs = resume_state.get("training_logs", {"loss": []})
+        else:
+            self.training_logs = {"loss": []}
         rng_jax = jax.random.PRNGKey(0)
         rng_np = np.random.default_rng(0)
 
@@ -148,19 +204,47 @@ class CellFlowTrainer:
             train_conditions = dataloader.data_manager.perturbation_covariates
         crun.on_train_begin(train_conditions=train_conditions, model=self.model)
 
-        pbar = tqdm(range(num_iterations))
+        if epoch_length is None:
+            epoch_length = valid_freq
+        iter_offset = int(initial_epoch_offset) * int(epoch_length)
+        remaining_iterations = max(num_iterations - iter_offset, 0)
+        pbar = tqdm(
+            range(remaining_iterations),
+            initial=iter_offset,
+            total=num_iterations,
+        )
         sampler = dataloader
         if isinstance(dataloader, OOCTrainSampler):
-            dataloader.set_sampler(num_iterations=num_iterations)
-        if early_stopping:
+            dataloader.set_sampler(num_iterations=remaining_iterations)
+        if resume_state is not None:
+            valid_loss = resume_state.get("valid_loss", 1e6)
+            waited = resume_state.get("waited", 0)
+            best_params = resume_state.get("best_params", None)
+            waited_lr = resume_state.get("waited_lr", 0)
+            lr_reductions = resume_state.get("lr_reductions", 0)
+            logger.info(
+                f"Resumed early-stopping state: valid_loss={valid_loss:.6f}, "
+                f"waited={waited}, waited_lr={waited_lr}, lr_reductions={lr_reductions}, "
+                f"epoch_offset={initial_epoch_offset}"
+            )
+        else:
             valid_loss = 1e6
             waited = 0
+            best_params = None
+            waited_lr = 0
+            lr_reductions = 0
+        adaptive_lr = lr_patience is not None and lr_patience > 0
         profile_started = False
+        on_cpu = jax.devices()[0].platform == "cpu"
         for it in pbar:
             rng_jax, rng_step_fn = jax.random.split(rng_jax, 2)
             batch = sampler.sample(rng_np)
             loss = self.solver.step_fn(rng_step_fn, batch)
             self.training_logs["loss"].append(float(loss))
+
+            if on_cpu and it > 0 and it % (valid_freq * 10) == 0:
+                jax.clear_caches()
+                gc.collect()
 
             if ((it - 1) % valid_freq == 0) and (it > 1):
                 # Get predictions from validation data
@@ -188,23 +272,80 @@ class CellFlowTrainer:
                     valid_source_data = valid_true_data = valid_pred_data = None
 
                 # Run callbacks
-                if epoch_length is None:
-                    epoch_length = valid_freq
-                current_epoch = it // epoch_length
+                current_epoch = int(it // epoch_length) + int(initial_epoch_offset)
                 metrics = crun.on_log_iteration(valid_source_data, valid_true_data, valid_pred_data, self.solver, state=self.solver.vf_state_inference, epoch_id=current_epoch)  # type: ignore[arg-type]
 
                 if validate:
                     self._update_logs(metrics)
-                    if early_stopping and current_epoch > min_epochs:
-                        print(metrics.keys())
-                        print(metrics)
-                        if metrics[early_stopping_metric] < valid_loss:
-                            valid_loss = metrics[early_stopping_metric]
+                    if (early_stopping or adaptive_lr) and current_epoch > min_epochs:
+                        current_metric = metrics[early_stopping_metric]
+                        improved = current_metric < valid_loss
+                        if improved:
+                            valid_loss = current_metric
                             waited = 0
+                            waited_lr = 0
+                            if early_stopping:
+                                best_params = jtu.tree_map(
+                                    lambda x: x.copy(),
+                                    self.solver.vf_state_inference.params,
+                                )
+                            logger.info(
+                                f"New best {early_stopping_metric}={valid_loss:.6f} at epoch {current_epoch}"
+                            )
                         else:
                             waited += 1
-                        if waited >= early_stopping_patience:
+                            waited_lr += 1
+
+                        if adaptive_lr and waited_lr >= lr_patience:
+                            hp_state, hp_parent = _find_hyperparams_state(
+                                self.solver.vf_state.opt_state
+                            )
+                            if hp_state is not None and "learning_rate" in hp_state.hyperparams:
+                                current_lr = float(hp_state.hyperparams["learning_rate"])
+                                new_lr = max(current_lr * lr_factor, min_lr)
+                                if new_lr < current_lr:
+                                    new_hyperparams = dict(hp_state.hyperparams)
+                                    new_hyperparams["learning_rate"] = jnp.asarray(
+                                        new_lr, dtype=jnp.asarray(current_lr).dtype
+                                    )
+                                    new_hp_state = hp_state._replace(hyperparams=new_hyperparams)
+                                    new_opt_state = _replace_hyperparams_state(
+                                        self.solver.vf_state.opt_state, hp_parent, new_hp_state
+                                    )
+                                    self.solver.vf_state = self.solver.vf_state.replace(
+                                        opt_state=new_opt_state
+                                    )
+                                    lr_reductions += 1
+                                    logger.info(
+                                        f"Reduced LR from {current_lr:.2e} to {new_lr:.2e} "
+                                        f"at epoch {current_epoch} (reduction #{lr_reductions})"
+                                    )
+                                    # Give the model a chance to improve at the new LR
+                                    waited = 0
+                                else:
+                                    logger.info(
+                                        f"LR plateau at epoch {current_epoch} but already at min_lr={min_lr:.2e}"
+                                    )
+                            else:
+                                logger.warning(
+                                    "lr_patience set but optimizer does not expose "
+                                    "'learning_rate' via optax.inject_hyperparams; "
+                                    f"opt_state type: {type(self.solver.vf_state.opt_state).__name__}; "
+                                    "skipping LR reduction."
+                                )
+                            waited_lr = 0
+
+                        if early_stopping and waited >= early_stopping_patience:
                             print(f"Early stopping at iteration {it}")
+                            if best_params is not None:
+                                self.solver.vf_state_inference = (
+                                    self.solver.vf_state_inference.replace(
+                                        params=best_params
+                                    )
+                                )
+                                logger.info(
+                                    f"Restored best params ({early_stopping_metric}={valid_loss:.6f})"
+                                )
                             jax.clear_caches()
                             gc.collect()
                             break
@@ -217,6 +358,21 @@ class CellFlowTrainer:
                     }
                     postfix_dict["loss"] = round(mean_loss, 3)
                     pbar.set_postfix(postfix_dict)
+
+                # Snapshot early-stopping state so a crash-resume can restore
+                # valid_loss/waited/waited_lr/lr_reductions/best_params/training_logs.
+                self._es_state = {
+                    "valid_loss": valid_loss,
+                    "waited": waited,
+                    "waited_lr": waited_lr,
+                    "lr_reductions": lr_reductions,
+                    "best_params": best_params,
+                    "training_logs": self.training_logs,
+                    "last_epoch": current_epoch,
+                }
+                crun.on_checkpoint(
+                    state=self.solver.vf_state_inference, epoch_id=current_epoch
+                )
             # Stop profiler after 100 iterations (outside validation block)
             if profile_started:
                 jax.profiler.stop_trace()

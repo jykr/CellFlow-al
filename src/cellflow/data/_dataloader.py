@@ -51,7 +51,7 @@ class TrainSampler:
             i: np.where(data.perturbation_covariates_mask == i)[0]
             for i in range(self.n_target_dists)
         }
-        self.print_batch = True
+        self.print_batch = False
 
     def _sample_target_dist_idx(self, source_dist_idx, rng):
         """Sample a target distribution index given the source distribution index."""
@@ -276,9 +276,16 @@ class ValidationSampler(BaseValidSampler):
             if mode == "on_log_iteration"
             else self.n_conditions_on_train_end
         )
-        condition_idcs = rng.choice(
-            self._data.n_perturbations, size=(size,), replace=False
-        )
+        try:
+            condition_idcs = rng.choice(
+                self._data.n_perturbations, size=(size,), replace=False
+            )
+        except ValueError as e:
+            # If there are fewer perturbations than requested, sample all available
+            logger.error(
+                f"Requested {size} conditions but only {self._data.n_perturbations} available., {self._data}"
+            )
+            raise e
 
         cell_rep_dict = {}
         cond_dict = {}

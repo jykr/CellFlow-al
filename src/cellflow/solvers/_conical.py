@@ -1,7 +1,20 @@
+from typing import Any
+from collections.abc import Callable
+from functools import partial
+import numpy as np
+from loguru import logger
+
+import diffrax
 import jax
 import jax.numpy as jnp
+from flax.core import frozen_dict
 from ott.neural.methods.flows import dynamics
+from ott.solvers import utils as solver_utils
+
+from cellflow import utils
 from cellflow.solvers._otfm import OTFlowMatching
+from cellflow._types import ArrayLike
+from cellflow.networks._velocity_field import ConditionalVelocityField
 
 __all__ = ["GaussianConicalSolver", "GaussianConicalFlow"]
 
@@ -35,26 +48,6 @@ class GaussianConicalFlow(dynamics.BaseFlow):
         """Conditional vector field for conical flow."""
         del x0  # unused in conical flow
         return (x1 - x) / (1 - t)
-
-
-from collections.abc import Callable
-from functools import partial
-import os
-from typing import Any
-from loguru import logger
-import diffrax
-import jax
-import jax.numpy as jnp
-import numpy as np
-from flax.core import frozen_dict
-from flax.training import train_state
-from ott.neural.methods.flows import dynamics
-from ott.solvers import utils as solver_utils
-
-from cellflow import utils
-from cellflow._types import ArrayLike
-from cellflow.networks._velocity_field import ConditionalVelocityField
-from cellflow.solvers.utils import ema_update
 
 
 class GaussianConicalSolver(OTFlowMatching):
@@ -102,174 +95,7 @@ class GaussianConicalSolver(OTFlowMatching):
         )
         self.vf_step_fn = self._get_vf_step_fn()
         self.n_time_per_sample = n_time_per_sample
-
-    def _get_vf_step_fn(self) -> Callable:  # type: ignore[type-arg]
-        @jax.jit
-        def vf_step_fn(
-            rng: jax.Array,
-            vf_state: train_state.TrainState,
-            time: jnp.ndarray,
-            source: jnp.ndarray,
-            target: jnp.ndarray,
-            conditions: dict[str, jnp.ndarray],
-            encoder_noise: jnp.ndarray,
-        ):
-            def loss_fn(
-                params: jnp.ndarray,
-                t: jnp.ndarray,
-                source: jnp.ndarray,
-                target: jnp.ndarray,
-                conditions: dict[str, jnp.ndarray],
-                encoder_noise: jnp.ndarray,
-                rng: jax.Array,
-            ) -> jnp.ndarray:
-                rng_flow, rng_encoder, rng_dropout = jax.random.split(rng, 3)
-                x_t = self.probability_path.compute_xt(rng_flow, t, source, target)
-                v_t, mean_cond, logvar_cond = vf_state.apply_fn(
-                    {"params": params},
-                    t,
-                    x_t,
-                    conditions,
-                    encoder_noise=encoder_noise,
-                    rngs={"dropout": rng_dropout, "condition_encoder": rng_encoder},
-                )
-                u_t = self.probability_path.compute_ut(t, x_t, source, target)
-
-                flow_matching_loss = jnp.mean((v_t - u_t) ** 2)
-                condition_mean_regularization = 0.5 * jnp.mean(mean_cond**2)
-                condition_var_regularization = -0.5 * jnp.mean(
-                    1 + logvar_cond - jnp.exp(logvar_cond)
-                )
-                if self.condition_encoder_mode == "stochastic":
-                    encoder_loss = (
-                        condition_mean_regularization + condition_var_regularization
-                    )
-                elif (self.condition_encoder_mode == "deterministic") and (
-                    self.condition_encoder_regularization > 0
-                ):
-                    encoder_loss = condition_mean_regularization
-                else:
-                    encoder_loss = 0.0
-                return flow_matching_loss + encoder_loss
-
-            grad_fn = jax.value_and_grad(loss_fn)
-            loss, grads = grad_fn(
-                vf_state.params, time, source, target, conditions, encoder_noise, rng
-            )
-            return vf_state.apply_gradients(grads=grads), loss
-
-        return vf_step_fn
-
-    def step_fn(
-        self,
-        rng: jnp.ndarray,
-        batch: dict[str, ArrayLike],
-    ) -> float:
-        """Single step function of the solver, but each x_1 is trained with many time points.
-
-        Parameters
-        ----------
-        rng
-            Random number generator.
-        batch
-            Data batch with keys ``src_cell_data``, ``tgt_cell_data``, and
-            optionally ``condition``.
-
-        Returns
-        -------
-        Loss value.
-        """
-        _, tgt = batch["src_cell_data"], batch["tgt_cell_data"]
-        condition = batch.get("condition")
-        rng_resample, rng_time, rng_step_fn, rng_encoder_noise = jax.random.split(
-            rng, 4
-        )
-
-        n_samples = tgt.shape[0]
-        encoder_noise = jax.random.normal(
-            rng_encoder_noise,
-            (n_samples * self.n_time_per_sample, self.vf.condition_embedding_dim),
-        )
-
-        # Sample single src point and n_time_per_sample time points for each sample in the batch
-        src = jax.random.normal(
-            rng_resample, (n_samples, tgt.shape[1])
-        )  # (n_samples, d)
-        time = self.time_sampler(rng_time, n_samples * self.n_time_per_sample).reshape(
-            n_samples,
-            self.n_time_per_sample,
-        )
-
-        # Reshape
-        src = jnp.tile(src, (1, self.n_time_per_sample)).reshape(
-            n_samples, self.n_time_per_sample, -1
-        )  # (n_samples, n_time_per_sample, d)
-        tgt = jnp.tile(tgt, (1, self.n_time_per_sample)).reshape(
-            n_samples, self.n_time_per_sample, -1
-        )  # (n_samples, n_time_per_sample, d)
-        condition = jax.tree.map(
-            lambda c: (
-                jnp.tile(c, (1, self.n_time_per_sample)).reshape(
-                    n_samples, self.n_time_per_sample, -1
-                )
-                if c is not None
-                else None
-            ),
-            condition,
-        )
-
-        # flatten everything
-        src = src.reshape(-1, src.shape[-1])
-        tgt = tgt.reshape(-1, tgt.shape[-1])
-        time = time.reshape(-1, 1)
-        condition = jax.tree.map(
-            lambda c: c.reshape(-1, c.shape[-1]) if c is not None else None, condition
-        )
-
-        self.vf_state, loss = self.vf_step_fn(
-            rng_step_fn,
-            self.vf_state,
-            time,
-            src,
-            tgt,
-            condition,
-            encoder_noise,
-        )
-
-        if self.ema == 1.0:
-            self.vf_state_inference = self.vf_state
-        else:
-            self.vf_state_inference = self.vf_state_inference.replace(
-                params=ema_update(
-                    self.vf_state_inference.params, self.vf_state.params, self.ema
-                )
-            )
-        return loss
-
-    def get_condition_embedding(
-        self, condition: dict[str, ArrayLike], return_as_numpy=True
-    ) -> ArrayLike:
-        """Get learnt embeddings of the conditions.
-
-        Parameters
-        ----------
-        condition
-            Conditions to encode
-        return_as_numpy
-            Whether to return the embeddings as numpy arrays.
-
-        Returns
-        -------
-        Mean and log-variance of encoded conditions.
-        """
-        cond_mean, cond_logvar = self.vf.apply(
-            {"params": self.vf_state_inference.params},
-            condition,
-            method="get_condition_embedding",
-        )
-        if return_as_numpy:
-            return np.asarray(cond_mean), np.asarray(cond_logvar)
-        return cond_mean, cond_logvar
+        self.match_fn = None
 
     def _predict_jit(
         self,
@@ -284,16 +110,16 @@ class GaussianConicalSolver(OTFlowMatching):
         kwargs.setdefault(
             "stepsize_controller", diffrax.PIDController(rtol=1e-5, atol=1e-5)
         )
-        # kwargs.setdefault("dt0", 0.01)  # Fixed step size: 100 steps total
-        # kwargs.setdefault("solver", diffrax.Euler())
-        # kwargs.setdefault("stepsize_controller", diffrax.ConstantStepSize())
         kwargs = frozen_dict.freeze(kwargs)
 
+        rng_encoder = utils.default_prng_key(rng)
         noise_dim = (1, self.vf.condition_embedding_dim)
-        use_mean = rng is None or self.condition_encoder_mode == "deterministic"
-        rng = utils.default_prng_key(rng)
+        use_mean = self.condition_encoder_mode == "deterministic"
+
         encoder_noise = (
-            jnp.zeros(noise_dim) if use_mean else jax.random.normal(rng, noise_dim)
+            jnp.zeros(noise_dim)
+            if use_mean
+            else jax.random.normal(rng_encoder, noise_dim)
         )
 
         def vf(
@@ -308,7 +134,7 @@ class GaussianConicalSolver(OTFlowMatching):
             )[0]
 
         def solve_ode(
-            x: jnp.ndarray,
+            x0: jnp.ndarray,
             condition: dict[str, jnp.ndarray],
             encoder_noise: jnp.ndarray,
         ) -> jnp.ndarray:
@@ -317,7 +143,7 @@ class GaussianConicalSolver(OTFlowMatching):
                 ode_term,
                 t0=0.0,
                 t1=1.0,
-                y0=x,
+                y0=x0,
                 args=(condition, encoder_noise),
                 max_steps=4096 * 4096,
                 **kwargs,
@@ -370,18 +196,24 @@ class GaussianConicalSolver(OTFlowMatching):
             return {}
 
         if batched:
+            logger.info("Using batched prediction with conical flow.")
+            rng = utils.default_prng_key(rng)
+            rng_noise, rng_encoder = jax.random.split(rng)
             keys = sorted(x.keys())
             condition_keys = sorted(set().union(*(condition[k].keys() for k in keys)))
-
+            sigma = self.probability_path.sigma
             # assert that the number of cells is the same for each condition
             n_cells = x[keys[0]].shape[0]
             for k in keys:
                 assert (
                     x[k].shape[0] == n_cells
                 ), "The number of cells must be the same for each condition"
-
             # Stack inputs and conditions
-            src_inputs = jnp.stack([x[k] for k in keys], axis=0)
+            key_rngs = jax.random.split(rng_noise, len(keys))
+            src_inputs = jnp.stack(
+                [sigma * jax.random.normal(k_rng, x[k].shape) for k_rng, k in zip(key_rngs, keys)],
+                axis=0,
+            )
             batched_conditions = {}
             for cond_key in condition_keys:
                 batched_conditions[cond_key] = jnp.stack(
@@ -398,9 +230,11 @@ class GaussianConicalSolver(OTFlowMatching):
 
             noise_dim = (1, self.vf.condition_embedding_dim)
             use_mean = rng is None or self.condition_encoder_mode == "deterministic"
-            rng = utils.default_prng_key(rng)
+
             encoder_noise = (
-                jnp.zeros(noise_dim) if use_mean else jax.random.normal(rng, noise_dim)
+                jnp.zeros(noise_dim)
+                if use_mean
+                else jax.random.normal(rng_encoder, noise_dim)
             )
 
             # Get params once outside the jitted function
@@ -419,21 +253,22 @@ class GaussianConicalSolver(OTFlowMatching):
                     0
                 ]
 
-            def solve_single_cell(x_cell, cond, enc_noise):
+            def solve_single_sample(x0, cond, enc_noise):
                 ode_term = diffrax.ODETerm(vf)
                 result = diffrax.diffeqsolve(
                     ode_term,
                     t0=0.0,
                     t1=1.0,
-                    y0=x_cell,
+                    y0=x0,
                     args=(cond, enc_noise),
+                    max_steps=4096 * 4096,
                     **kwargs,
                 )
                 return result.ys[0]
 
             def solve_condition(x_batch, cond):
                 # vmap over cells within a condition
-                return jax.vmap(solve_single_cell, in_axes=(0, None, None))(
+                return jax.vmap(solve_single_sample, in_axes=(0, None, None))(
                     x_batch, cond, encoder_noise
                 )
 
@@ -445,20 +280,19 @@ class GaussianConicalSolver(OTFlowMatching):
             pred_targets = batched_solve(src_inputs, batched_conditions)
             return {k: pred_targets[i] for i, k in enumerate(keys)}
         elif isinstance(x, dict):
-            return jax.tree.map(
-                partial(self._predict_jit, rng=rng, **kwargs),
-                x,
-                condition,  # type: ignore[attr-defined]
-            )
+            rng_noise, rng_encoder = jax.random.split(utils.default_prng_key(rng))
+            key_rngs = jax.random.split(rng_noise, len(x))
+            src_inputs = {
+                k: self.probability_path.sigma
+                * jax.random.normal(k_rng, v.shape)
+                for k_rng, (k, v) in zip(key_rngs, x.items())
+            }
+            key_encoders = jax.random.split(rng_encoder, len(x))
+            output = {k: self._predict_jit(src_inputs[k], condition[k], k_rng, **kwargs) for (k_rng, k) in zip(key_encoders, x.keys())}
+            return output
         else:
-            x_pred = self._predict_jit(x, condition, rng, **kwargs)
+            src_input = self.probability_path.sigma * jax.random.normal(
+                utils.default_prng_key(rng), x.shape
+            )
+            x_pred = self._predict_jit(src_input, condition, rng, **kwargs)
             return np.array(x_pred)
-
-    @property
-    def is_trained(self) -> bool:
-        """Whether the model is trained."""
-        return self._is_trained
-
-    @is_trained.setter
-    def is_trained(self, value: bool) -> None:
-        self._is_trained = value

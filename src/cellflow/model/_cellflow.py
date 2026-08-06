@@ -581,6 +581,11 @@ class CellFlow:
         early_stopping=True,
         min_epochs=100,
         early_stopping_patience=5,
+        lr_patience: int | None = None,
+        lr_factor: float = 0.5,
+        min_lr: float = 1e-6,
+        resume_state: dict | None = None,
+        initial_epoch_offset: int = 0,
     ) -> None:
         """Train the model.
 
@@ -659,6 +664,11 @@ class CellFlow:
             early_stopping=early_stopping,
             early_stopping_patience=early_stopping_patience,
             min_epochs=min_epochs,
+            lr_patience=lr_patience,
+            lr_factor=lr_factor,
+            min_lr=min_lr,
+            resume_state=resume_state,
+            initial_epoch_offset=initial_epoch_offset,
         )
 
     def predict(
