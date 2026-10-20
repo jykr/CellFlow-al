@@ -72,7 +72,7 @@ class OTFlowMatching:
         )
         self.vf_step_fn = self._get_vf_step_fn()
 
-    def _get_vf_step_fn(self) -> Callable:  # type: ignore[type-arg]
+    def _get_vf_step_fn(self, path_noise=True) -> Callable:  # type: ignore[type-arg]
         @jax.jit
         def vf_step_fn(
             rng: jax.Array,
@@ -169,9 +169,6 @@ class OTFlowMatching:
                     source_labels,
                     target_labels,
                 )
-                if not os.path.exists("/scratch/jr7348/match.npy"):
-                    np.save("/scratch/jr7348/match.npy", np.array(tmat))
-                    np.save("/scratch/jr7348/src_labels.npy", np.array(source_labels))
             elif self.match_fn.__name__ == "match_linear":
                 tmat = self.match_fn(src, tgt)
             else:

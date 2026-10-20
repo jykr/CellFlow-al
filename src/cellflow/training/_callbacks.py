@@ -680,10 +680,15 @@ class CallbackRunner:
         for callback in self.logging_callbacks:
             callback.on_log_iteration(dict_to_log)  # type: ignore[call-arg]
 
+        return dict_to_log
+
+    def on_checkpoint(self, state=None, epoch_id: int | None = None) -> None:
+        """Invoke checkpoint callbacks. Called after the early-stopping block so
+        that any state the callback snapshots (via ``trainer._es_state``) reflects
+        the most recent validation result, enabling a clean resume after a crash.
+        """
         for callback in self.checkpoint_callbacks:
             callback.on_log_iteration(state, epoch_id)
-
-        return dict_to_log
 
     def on_train_end(
         self,
