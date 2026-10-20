@@ -1,7 +1,0 @@
-References
-==========
-
-Bibliography
-------------
-.. bibliography::
-    :cited:
