@@ -389,6 +389,29 @@ class CellFlowTrainer:
             )
 
         if num_iterations > 0:
+            # Restore the best-validation params before the final evaluation.
+            #
+            # Previously this happened ONLY on the early-stopping branch above
+            # (`waited >= early_stopping_patience` -> restore -> break). A run
+            # that instead exhausted `num_iterations` kept its FINAL params, so
+            # `source_data`/`true_data`/`pred_data` -- and therefore every
+            # transport plot and metric derived from them -- described the
+            # last epoch rather than the best one. For an overfitting run those
+            # differ a lot: FIT25 l2 peaked at valid_sinkhorn 0.0720 around
+            # epoch 10-11k and ended at 0.1010 (+40%) at its 20k cap, and the
+            # 0.1010 state is what got measured.
+            #
+            # Idempotent: when early stopping already restored, best_params is
+            # the state we are re-assigning, so this is a no-op. `best_params`
+            # is only populated when early_stopping is on, hence the None check.
+            if best_params is not None:
+                self.solver.vf_state_inference = (
+                    self.solver.vf_state_inference.replace(params=best_params)
+                )
+                logger.info(
+                    f"Restored best params before final validation "
+                    f"({early_stopping_metric}={valid_loss:.6f})"
+                )
             valid_source_data, valid_true_data, valid_pred_data = self._validation_step(
                 valid_loaders, mode="on_train_end"
             )

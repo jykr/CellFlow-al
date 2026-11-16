@@ -112,9 +112,11 @@ class GaussianConicalSolver(OTFlowMatching):
         )
         kwargs = frozen_dict.freeze(kwargs)
 
+        # rng=None -> mean condition embedding (see `predict`'s docstring). Before
+        # 2026-11-11 this ignored rng=None and always sampled a stochastic encoder.
+        use_mean = rng is None or self.condition_encoder_mode == "deterministic"
         rng_encoder = utils.default_prng_key(rng)
         noise_dim = (1, self.vf.condition_embedding_dim)
-        use_mean = self.condition_encoder_mode == "deterministic"
 
         encoder_noise = (
             jnp.zeros(noise_dim)
@@ -197,6 +199,10 @@ class GaussianConicalSolver(OTFlowMatching):
 
         if batched:
             logger.info("Using batched prediction with conical flow.")
+            # Decided before the rng is defaulted (fixed 2026-11-11: the check came after
+            # `default_prng_key`, so rng=None still sampled a stochastic encoder and every
+            # trainer validation metric -- which passes no rng -- was a sampled-embedding score).
+            use_mean = rng is None or self.condition_encoder_mode == "deterministic"
             rng = utils.default_prng_key(rng)
             rng_noise, rng_encoder = jax.random.split(rng)
             keys = sorted(x.keys())
@@ -229,7 +235,6 @@ class GaussianConicalSolver(OTFlowMatching):
             kwargs = frozen_dict.freeze(kwargs)
 
             noise_dim = (1, self.vf.condition_embedding_dim)
-            use_mean = rng is None or self.condition_encoder_mode == "deterministic"
 
             encoder_noise = (
                 jnp.zeros(noise_dim)
@@ -288,7 +293,7 @@ class GaussianConicalSolver(OTFlowMatching):
                 for k_rng, (k, v) in zip(key_rngs, x.items())
             }
             key_encoders = jax.random.split(rng_encoder, len(x))
-            output = {k: self._predict_jit(src_inputs[k], condition[k], k_rng, **kwargs) for (k_rng, k) in zip(key_encoders, x.keys())}
+            output = {k: self._predict_jit(src_inputs[k], condition[k], None if rng is None else k_rng, **kwargs) for (k_rng, k) in zip(key_encoders, x.keys())}
             return output
         else:
             src_input = self.probability_path.sigma * jax.random.normal(
